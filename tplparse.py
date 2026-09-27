@@ -56,12 +56,39 @@ def _match_bracket(s, pos, open_ch, close_ch):
     return len(s) - 1
 
 
+# SHM включает ANYCASE => 1: ключевые слова TT можно писать строчными (`{{ end }}`, `{{ stop }}`)
+TT_KEYWORDS = {'IF', 'ELSIF', 'ELSE', 'END', 'UNLESS', 'FOR', 'FOREACH', 'WHILE', 'BLOCK', 'SWITCH', 'CASE',
+               'STOP', 'RETURN', 'PROCESS', 'INCLUDE', 'INSERT', 'WRAPPER', 'FILTER', 'MACRO', 'TRY', 'CATCH',
+               'FINAL', 'THROW', 'PERL', 'RAWPERL', 'SET', 'GET', 'CALL', 'DEFAULT', 'USE', 'LAST', 'NEXT',
+               'CLEAR', 'META', 'TAGS', 'DEBUG'}
+_KW_RE = re.compile(r'\b(if|unless|in|block|perl|rawperl)\b', re.I)
+
+
+def norm_stmt(st):
+    """Ключевые слова — в верхний регистр: `end` -> END, `stop if x` -> STOP IF x, `t = block` -> t = BLOCK."""
+    parts = st.split(None, 1)
+    if not parts:
+        return st
+    head = parts[0].upper()
+    if head in TT_KEYWORDS:
+        rest = parts[1] if len(parts) > 1 else ''
+        if head in ('STOP', 'RETURN', 'LAST', 'NEXT', 'CLEAR'):
+            rest = re.sub(r'^(if|unless)\b', lambda m: m.group(1).upper(), rest, flags=re.I)
+        elif head in ('FOR', 'FOREACH'):
+            rest = re.sub(r'^(\w+\s+)in\b', lambda m: m.group(1) + 'IN', rest, flags=re.I)
+        return head + (' ' + rest if rest else '')
+    m = re.match(r'^(\w+\s*=\s*)(block|perl|rawperl)\b(.*)$', st, re.I | re.S)
+    if m:
+        return m.group(1) + m.group(2).upper() + m.group(3)
+    return st
+
+
 def _stmts(directive_body):
     out = []
     for st in directive_body.split(';'):
         st = re.sub(r'\s#.*$', '', st.strip(), flags=re.S).strip()  # `END #TEXT` — хвостовой комментарий
         if st:
-            out.append(st)
+            out.append(norm_stmt(st))
     return out
 
 
@@ -75,7 +102,7 @@ def _is_opener(stmt):
 def find_blocks(src):
     """Находит `{{ VAR = BLOCK }} ... {{ END }}` с учётом вложенности. -> [(name, start, end, body)]"""
     out = []
-    for m in re.finditer(r'\{\{-?\s*(\w+)\s*=\s*BLOCK\s*-?\}\}', src):
+    for m in re.finditer(r'\{\{-?\s*(\w+)\s*=\s*BLOCK\s*-?\}\}', src, re.I):
         depth = 1
         for d in DIRECTIVE_RE.finditer(src, m.end()):
             for st in _stmts(d.group(1)):
@@ -94,7 +121,7 @@ def humanize_tt(text):
     text = re.sub(r'<tg-emoji[^>]*>(.*?)</tg-emoji>', r'\1', text, flags=re.S)
 
     def repl(m):
-        body = m.group(1).strip()
+        body = norm_stmt(m.group(1).strip())
         head = body.split(None, 1)[0] if body else ''
         rest = body[len(head):].strip()
         if head == 'IF':
@@ -463,9 +490,9 @@ def parse_bot_calls(src, vs=None):
 
 def bot_case(src, cmd):
     """Текст ветки `<% CASE '/cmd' %>` (или CASE [ '/a', '/b' ]) шаблона бота."""
-    marks = list(re.finditer(r'<%-?\s*(CASE|END)\b(.*?)-?%>', src, re.S))
+    marks = list(re.finditer(r'<%-?\s*(CASE|END)\b(.*?)-?%>', src, re.S | re.I))
     for i, m in enumerate(marks):
-        if m.group(1) != 'CASE':
+        if m.group(1).upper() != 'CASE':
             continue
         vals = re.findall(r"""['"]([^'"]+)['"]""", m.group(2))
         if cmd in vals:
