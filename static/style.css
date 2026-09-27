@@ -31,7 +31,7 @@ code { background: var(--bg3); padding: 1px 5px; border-radius: 4px; font-size: 
 #topoList li:hover { background: var(--bg3); }
 #topoList li.active { background: #243052; }
 #topoList .cnt { color: var(--muted); font-size: 11px; }
-.side-foot { border-top: 1px solid var(--line); padding-top: 10px; }
+.side-foot { border-top: 1px solid var(--line); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
 
 /* main */
 #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
@@ -174,3 +174,52 @@ ul.conds.tech { color: var(--muted); font-size: 11.5px; }
 .publist .check { font-size: 12px; color: var(--text); }
 .pill { font-size: 10px; background: #243052; color: #9fb8ff; border-radius: 4px; padding: 0 5px; margin-left: 4px; }
 .lg.push { background: var(--c-push); } .lg.bot_cmd { background: var(--c-bot_cmd); } .lg.entry { background: var(--c-entry); }
+
+/* вход */
+body.login-page { align-items: center; justify-content: center; }
+.login-card { width: min(340px, 92vw); background: var(--bg2); border: 1px solid var(--line); border-radius: 14px; padding: 26px 24px; display: flex; flex-direction: column; gap: 14px; box-shadow: 0 10px 40px rgba(0,0,0,.4); }
+.login-card .brand { font-size: 20px; text-align: center; margin-bottom: 4px; }
+.login-card .btn { padding: 9px; }
+.login-err { color: var(--danger); font-size: 12.5px; min-height: 16px; }
+
+/* модальные окна */
+.modal { width: min(440px, 92vw); }
+.modal .dlg p { color: var(--text); line-height: 1.5; white-space: pre-line; }
+.modal .dlg h3 { display: flex; gap: 8px; align-items: center; }
+.btn.danger-solid { background: var(--danger); border-color: var(--danger); color: #fff; }
+.btn.danger-solid:hover { filter: brightness(1.1); }
+
+/* режим просмотра */
+body.viewer .edit-only { display: none !important; }
+body.viewer .node .port { display: none; }
+.user-box { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 12px; color: var(--muted); }
+.role-pill { font-size: 10.5px; border-radius: 4px; padding: 1px 6px; background: #243052; color: #9fb8ff; }
+
+/* скрываемое левое меню */
+#sidebar { transition: margin-left .18s ease; }
+body.side-collapsed #sidebar { margin-left: -250px; }
+#btnSide { font-size: 15px; line-height: 1; padding: 4px 8px; }
+
+/* растягиваемая правая панель */
+#panel { position: relative; width: var(--panel-w, 380px); min-width: 300px; max-width: 75vw; }
+#panelResize { position: absolute; left: -4px; top: 0; bottom: 0; width: 8px; cursor: col-resize; z-index: 5; }
+#panelResize::after { content: ""; position: absolute; left: 3px; top: 50%; width: 2px; height: 36px; margin-top: -18px; border-radius: 2px; background: var(--line); transition: background .12s; }
+#panelResize:hover::after, body.resizing #panelResize::after { background: var(--accent); height: 100%; top: 0; margin-top: 0; }
+body.resizing { cursor: col-resize; user-select: none; }
+body.resizing iframe, body.resizing #canvas { pointer-events: none; }
+
+/* список найденного */
+#search { width: 220px; }
+.search-list { position: fixed; z-index: 20; max-height: min(60vh, 520px); overflow: auto; background: var(--bg2); border: 1px solid #3a4252; border-radius: 10px; box-shadow: 0 12px 34px rgba(0,0,0,.5); padding: 4px; }
+.sl-head { font-size: 11.5px; color: var(--text); padding: 6px 8px; border-bottom: 1px solid var(--line); margin-bottom: 3px; position: sticky; top: -4px; background: var(--bg2); }
+.sl-item { display: flex; gap: 8px; padding: 6px 8px; border-radius: 7px; cursor: pointer; }
+.sl-item:hover { background: var(--bg3); }
+.sl-item.active { background: #243052; }
+.sl-ic { font-size: 14px; line-height: 18px; flex: none; }
+.sl-body { min-width: 0; flex: 1; }
+.sl-title { font-size: 12.5px; font-weight: 600; word-break: break-word; }
+.sl-ctx { font-size: 10.5px; color: var(--muted); margin-top: 1px; word-break: break-word; }
+.sl-snip { font-size: 11.5px; color: #b7bfcf; margin-top: 2px; word-break: break-word; }
+.sl-field { color: var(--muted); }
+.search-list mark { background: rgba(245,213,71,.3); color: #fff; border-radius: 2px; padding: 0 1px; }
+.sl-more { font-size: 11.5px; color: var(--muted); padding: 6px 8px; }

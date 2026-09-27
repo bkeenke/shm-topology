@@ -11,21 +11,24 @@
 <aside id="sidebar">
   <div class="brand">SHM <b>Topology</b></div>
   <div class="side-actions">
-    <button id="btnNewTopo" class="btn">＋ Новая</button>
-    <button id="btnImport" class="btn primary">⇪ Импорт</button>
+    <button id="btnNewTopo" class="btn edit-only">＋ Новая</button>
+    <button id="btnImport" class="btn primary edit-only">⇪ Импорт</button>
   </div>
   <input id="topoFilter" class="input" placeholder="Фильтр топологий…">
   <ul id="topoList"></ul>
   <div class="side-foot">
-    <button id="btnRestore" class="btn ghost small">Загрузить из .json</button>
+    <button id="btnRestore" class="btn ghost small edit-only">Загрузить из .json</button>
     <input id="restoreFile" type="file" accept=".json" hidden>
+    <div class="user-box"><span><span id="meLogin"></span> <span id="meRole" class="role-pill"></span></span>
+      <button id="btnLogout" class="btn ghost small">Выйти</button></div>
   </div>
 </aside>
 
 <main id="main">
   <header id="toolbar">
+    <button id="btnSide" class="btn small ghost" title="Скрыть/показать меню ([)">☰</button>
     <input id="topoName" class="title-input" placeholder="Название топологии" disabled>
-    <div class="tb-group">
+    <div class="tb-group edit-only">
       <select id="addType" class="input small">
         <option value="event">⚡ Событие</option>
         <option value="template">🧩 Шаблон</option>
@@ -40,18 +43,18 @@
       <button id="btnAdd" class="btn small">＋ Узел</button>
     </div>
     <div class="tb-group">
-      <input id="search" class="input small" placeholder="Поиск узла… (/)">
-      <button id="btnLayout" class="btn small" title="Авто-раскладка">⌗ Раскладка</button>
+      <input id="search" class="input small" placeholder="Поиск узла… (/)" autocomplete="off">
+      <button id="btnLayout" class="btn small edit-only" title="Авто-раскладка">⌗ Раскладка</button>
       <button id="btnFit" class="btn small" title="Показать всё (F)">⤢</button>
-      <span class="help" title="Колесо — зум · перетаскивание фона — сдвиг · тяни ● справа у узла — новая связь · двойной клик по фону — заметка · Del — удалить · F — показать всё · / — поиск">?</span>
+      <span class="help" title="Колесо — зум · перетаскивание фона — сдвиг · тяни ● справа у узла — новая связь · двойной клик по фону — заметка · Del — удалить · F — показать всё · / — поиск · [ — скрыть меню">?</span>
       <button id="btnZoomOut" class="btn small">−</button>
       <span id="zoomVal">100%</span>
       <button id="btnZoomIn" class="btn small">＋</button>
     </div>
     <div class="tb-group">
-      <button id="btnDup" class="btn small ghost" title="Дублировать топологию">⧉</button>
+      <button id="btnDup" class="btn small ghost edit-only" title="Дублировать топологию">⧉</button>
       <button id="btnExport" class="btn small ghost" title="Экспорт в JSON">⇩</button>
-      <button id="btnDelTopo" class="btn small ghost danger" title="Удалить топологию">🗑</button>
+      <button id="btnDelTopo" class="btn small ghost danger edit-only" title="Удалить топологию">🗑</button>
     </div>
   </header>
 
@@ -88,6 +91,7 @@
 </main>
 
 <aside id="panel" class="hidden">
+  <div id="panelResize" title="Потяните, чтобы изменить ширину (двойной клик — сброс)"></div>
   <div class="panel-head">
     <span id="panelTitle">Узел</span>
     <button id="panelClose" class="btn ghost small">✕</button>
@@ -129,6 +133,19 @@
   </form>
 </dialog>
 
+<dialog id="modal" class="modal">
+  <form method="dialog" class="dlg">
+    <h3 id="modalTitle"></h3>
+    <p id="modalText"></p>
+    <input id="modalInput" class="input hidden">
+    <div class="dlg-actions">
+      <button id="modalCancel" value="cancel" class="btn ghost">Отмена</button>
+      <button id="modalOk" value="ok" class="btn primary">OK</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="searchList" class="search-list hidden"></div>
 <div id="toast"></div>
 <script src="/vendor/dagre.min.js"></script>
 <script src="/app.js"></script>

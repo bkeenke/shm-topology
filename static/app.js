@@ -24,10 +24,43 @@ const api = async (method, url, body) => {
     method, headers: body ? { 'Content-Type': 'application/json' } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
+  if (r.status === 401) { location.href = '/login.html'; throw new Error('нужен вход'); }
   const data = await r.json();
-  if (!r.ok) throw new Error(data.error || r.statusText);
+  if (!r.ok) {
+    if (r.status === 403) toast('Только просмотр: изменения недоступны');
+    throw new Error(data.error || r.statusText);
+  }
   return data;
 };
+
+/* ------------------------------------------------------------ модальное окно (вместо confirm/prompt) */
+
+function ask({ title, text = '', ok = 'OK', cancel = 'Отмена', danger = false, input = null }) {
+  const dlg = $('#modal'), inp = $('#modalInput');
+  $('#modalTitle').textContent = title;
+  $('#modalText').textContent = text;
+  $('#modalText').classList.toggle('hidden', !text);
+  $('#modalOk').textContent = ok;
+  $('#modalOk').className = 'btn ' + (danger ? 'danger-solid' : 'primary');
+  $('#modalCancel').textContent = cancel;
+  inp.classList.toggle('hidden', input === null);
+  inp.value = input ?? '';
+  dlg.returnValue = '';
+  dlg.showModal();
+  if (input !== null) setTimeout(() => { inp.focus(); inp.select(); }, 0); else $('#modalOk').focus();
+  return new Promise((resolve) => {
+    dlg.addEventListener('close', () => {
+      if (dlg.returnValue !== 'ok') return resolve(input !== null ? null : false);
+      resolve(input !== null ? inp.value.trim() : true);
+    }, { once: true });
+  });
+}
+
+$('#modalInput').addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter') { ev.preventDefault(); $('#modal').close('ok'); }
+});
+
+const canEdit = () => S.role === 'admin';
 
 const toast = (msg) => {
   const t = $('#toast'); t.textContent = msg; t.classList.add('show');
@@ -63,10 +96,11 @@ async function openTopo(id) {
   S.edges = new Map(d.edges.map((e) => [e.id, e]));
   S.sel = null;
   localStorage.setItem('shm-topo-last', id);
-  $('#topoName').value = S.topo.name; $('#topoName').disabled = false;
+  $('#topoName').value = S.topo.name; $('#topoName').disabled = !canEdit();
   $('#empty').classList.add('hidden');
   closePanel();
   renderAll();
+  renderSearchList();
   const missing = [...S.nodes.values()].filter((n) => n.x == null);
   if (missing.length === S.nodes.size && missing.length) {
     autoLayout(true);
@@ -327,6 +361,87 @@ async function placeNew(list) {
   toast(`Новых узлов: ${list.length} — поставлены рядом со связанными`);
 }
 
+/* ------------------------------------------------------------ поиск */
+
+function searchFields(n) {
+  const m = n.meta || {};
+  return [
+    ['название', n.title], ['ключ', n.key], ['описание', n.subtitle], ['текст', n.content],
+    ['кнопка', (m.buttons || []).flat().map((b) => b.text).join(' · ')],
+    ['условие', (m.when || []).concat(m.guards || []).join(' · ')],
+    ['тема', m.subject], ['ссылка', m.link],
+  ];
+}
+
+// -> [поле, текст] первого совпадения или null
+function searchMatch(n, q) {
+  for (const [label, v] of searchFields(n)) if (v && String(v).toLowerCase().includes(q)) return [label, String(v)];
+  return null;
+}
+
+function snippet(text, q) {
+  const flat = text.replace(/\s+/g, ' ');
+  const i = flat.toLowerCase().indexOf(q);
+  const from = Math.max(0, i - 30), to = Math.min(flat.length, i + q.length + 50);
+  return (from ? '…' : '') + esc(flat.slice(from, i)) + '<mark>' + esc(flat.slice(i, i + q.length)) + '</mark>'
+    + esc(flat.slice(i + q.length, to)) + (to < flat.length ? '…' : '');
+}
+
+const SR = { items: [], active: -1 };
+
+// что показать строкой в списке: у сообщений — первая содержательная строка текста
+function listTitle(n) {
+  if (['tg_message', 'email', 'push'].includes(n.type) && n.content) {
+    const line = n.content.split('\n').map((l) => l.replace(/\[[^\]]*\]/g, '').trim()).find((l) => l.length > 2);
+    if (line) return line.length > 70 ? line.slice(0, 69) + '…' : line;
+  }
+  return n.title || n.key || '(без названия)';
+}
+
+function renderSearchList() {
+  const box = $('#searchList'), q = S.search.trim().toLowerCase();
+  if (!q || !S.topo) { box.classList.add('hidden'); SR.items = []; return; }
+  SR.items = [...S.nodes.values()].map((n) => ({ n, m: searchMatch(n, q) })).filter((x) => x.m)
+    .sort((a, b) => (a.m[0] !== 'название') - (b.m[0] !== 'название') || (a.n.y ?? 0) - (b.n.y ?? 0));
+  SR.active = Math.min(SR.active, SR.items.length - 1);
+  const r = $('#search').getBoundingClientRect();
+  box.style.left = r.left + 'px';
+  box.style.top = r.bottom + 4 + 'px';
+  box.style.width = Math.max(360, r.width) + 'px';
+  const LIMIT = 60;
+  box.innerHTML = `<div class="sl-head">${SR.items.length ? `Найдено: <b>${SR.items.length}</b> <span class="muted">· ↑↓ Enter — перейти</span>` : 'Ничего не найдено'}</div>`
+    + SR.items.slice(0, LIMIT).map(({ n, m }, i) => {
+      const T = TYPES[n.type] || TYPES.note;
+      const lt = listTitle(n);
+      const title = lt.toLowerCase().includes(q) ? snippet(lt, q) : esc(lt);
+      const ctx = [n.type === 'tg_message' ? n.title : '', n.key && n.key !== lt ? n.key : ''].filter(Boolean).join(' · ');
+      const showSnip = !lt.toLowerCase().includes(q);
+      return `<div class="sl-item${i === SR.active ? ' active' : ''}" data-i="${i}">
+        <span class="sl-ic" style="color:${T.color}">${T.icon}</span>
+        <div class="sl-body"><div class="sl-title">${title}</div>
+        <div class="sl-ctx">${esc(T.name)}${ctx ? ' · ' + esc(ctx) : ''}</div>
+        ${showSnip ? `<div class="sl-snip"><span class="sl-field">${m[0]}:</span> ${snippet(m[1], q)}</div>` : ''}</div></div>`;
+    }).join('')
+    + (SR.items.length > LIMIT ? `<div class="sl-more">и ещё ${SR.items.length - LIMIT}… уточните запрос</div>` : '');
+  box.classList.remove('hidden');
+  box.querySelector('.sl-item.active')?.scrollIntoView({ block: 'nearest' });
+}
+
+function goSearchItem(i) {
+  const it = SR.items[i];
+  if (!it) return;
+  centerOn(it.n);
+  select({ kind: 'node', id: it.n.id });
+  SR.active = i;
+  renderSearchList();
+}
+
+$('#searchList').addEventListener('mousedown', (ev) => {
+  ev.preventDefault(); // не терять фокус поля
+  const el = ev.target.closest('.sl-item');
+  if (el) goSearchItem(+el.dataset.i);
+});
+
 /* ------------------------------------------------------------ подсветка связей */
 
 function reach(start, dir) {
@@ -349,9 +464,9 @@ function applyHighlight() {
   }
   S.nodes.forEach((n) => {
     if (!n._el) return;
-    const hit = q && [n.title, n.key, n.subtitle, n.content].some((v) => (v || '').toLowerCase().includes(q));
+    const hit = q && !!searchMatch(n, q);
     n._el.classList.toggle('hit', !!hit);
-    n._el.classList.toggle('dim', (keep && !keep.has(n.id)) || (!!q && !hit));
+    n._el.classList.toggle('dim', keep ? !keep.has(n.id) : (!!q && !hit));
     n._el.classList.toggle('sel', !!(S.sel && S.sel.kind === 'node' && S.sel.id === n.id));
   });
   edgesSvg.querySelectorAll('.edge').forEach((g) => {
@@ -370,7 +485,7 @@ canvas.addEventListener('mousedown', (ev) => {
   const port = ev.target.closest('.port');
   const nodeEl = ev.target.closest('.node');
   const edgeEl = ev.target.closest('.edge');
-  if (port && nodeEl) {
+  if (port && nodeEl && canEdit()) {
     drag = { mode: 'link', from: +nodeEl.dataset.id };
     ev.preventDefault();
     return;
@@ -451,7 +566,7 @@ canvas.addEventListener('wheel', (ev) => {
 }, { passive: false });
 
 canvas.addEventListener('dblclick', async (ev) => {
-  if (!S.topo || ev.target.closest('.node') || ev.target.closest('.edge')) return;
+  if (!S.topo || !canEdit() || ev.target.closest('.node') || ev.target.closest('.edge')) return;
   const p = toWorld(ev.clientX, ev.clientY);
   await addNode('note', p.x - 130, p.y - 20);
 });
@@ -558,6 +673,13 @@ function showEdgePanel(e) {
 
 function bindPanel(obj, table) {
   const body = $('#panelBody');
+  if (!canEdit()) {
+    body.querySelectorAll('input, textarea, select').forEach((el) => {
+      el.readOnly = true; el.disabled = el.tagName === 'SELECT'; el.placeholder = '';
+      if (!el.value && el.closest('label.field')) el.closest('label.field').remove();  // пустые поля в просмотре не нужны
+    });
+    body.querySelectorAll('[data-act="del"], [data-act="accept"], [data-act="keep"]').forEach((el) => el.remove());
+  }
   const save = async (patch) => {
     const upd = await api('PATCH', `${table}/${obj.id}`, patch);
     Object.assign(obj, upd);
@@ -601,18 +723,21 @@ function bindPanel(obj, table) {
     Object.assign(obj, await api('POST', `nodes/${obj.id}/${act}`, {}));
     renderNode(obj); renderEdges(); applyHighlight(); select(S.sel);
   }));
-  body.querySelector('[data-act="del"]').addEventListener('click', () => deleteSel());
+  body.querySelector('[data-act="del"]')?.addEventListener('click', () => deleteSel());
 }
 
 async function deleteSel() {
   if (!S.sel) return;
   if (S.sel.kind === 'node') {
     const n = S.nodes.get(S.sel.id);
-    if (!confirm(`Удалить узел «${n.title || n.key}» и его связи?`)) return;
+    const links = [...S.edges.values()].filter((e) => e.source_id === n.id || e.target_id === n.id).length;
+    if (!await ask({ title: '🗑 Удалить узел?', text: `«${n.title || n.key}»${links ? `\nВместе с ним удалятся связи: ${links}.` : ''}`, ok: 'Удалить', danger: true })) return;
     await api('DELETE', 'nodes/' + n.id);
     S.nodes.delete(n.id); n._el.remove();
     [...S.edges.values()].filter((e) => e.source_id === n.id || e.target_id === n.id).forEach((e) => S.edges.delete(e.id));
   } else {
+    const e = S.edges.get(S.sel.id), a = S.nodes.get(e.source_id), b = S.nodes.get(e.target_id);
+    if (!await ask({ title: '🗑 Удалить связь?', text: `${a?.title || a?.key} → ${b?.title || b?.key}${e.label ? `\n(${e.label})` : ''}`, ok: 'Удалить', danger: true })) return;
     await api('DELETE', 'edges/' + S.sel.id);
     S.edges.delete(S.sel.id);
   }
@@ -763,7 +888,7 @@ $('#importDlg').addEventListener('close', async () => {
 $('#topoList').addEventListener('click', (ev) => { const li = ev.target.closest('li'); if (li) openTopo(+li.dataset.id); });
 $('#topoFilter').addEventListener('input', renderTopoList);
 $('#btnNewTopo').addEventListener('click', async () => {
-  const name = prompt('Название топологии', 'Новая топология');
+  const name = await ask({ title: '＋ Новая схема', text: 'Название схемы', input: 'Новая топология', ok: 'Создать' });
   if (!name) return;
   const r = await api('POST', 'topologies', { name });
   await loadTopos(); openTopo(r.id);
@@ -773,12 +898,16 @@ $('#topoName').addEventListener('change', async (ev) => {
   S.topo.name = ev.target.value; await loadTopos();
 });
 $('#btnAdd').addEventListener('click', () => addNode($('#addType').value));
-$('#btnLayout').addEventListener('click', () => S.topo && confirm('Переразложить все узлы автоматически? Ручные позиции будут перезаписаны.') && autoLayout());
+$('#btnLayout').addEventListener('click', async () => S.topo && await ask({
+  title: '⌗ Авто-раскладка', text: 'Все узлы будут переставлены автоматически.\nРучные позиции перезапишутся.', ok: 'Переразложить',
+}) && autoLayout());
 $('#btnFit').addEventListener('click', () => fit());
 $('#btnZoomIn').addEventListener('click', () => zoomAt(S.view.k * 1.2, canvas.clientWidth / 2, canvas.clientHeight / 2));
 $('#btnZoomOut').addEventListener('click', () => zoomAt(S.view.k / 1.2, canvas.clientWidth / 2, canvas.clientHeight / 2));
 $('#btnDelTopo').addEventListener('click', async () => {
-  if (!S.topo || !confirm(`Удалить топологию «${S.topo.name}» целиком?`)) return;
+  if (!S.topo || !await ask({
+    title: '🗑 Удалить схему?', text: `«${S.topo.name}» — ${S.nodes.size} узлов и ${S.edges.size} связей.\nОтменить будет нельзя.`, ok: 'Удалить схему', danger: true,
+  })) return;
   await api('DELETE', 'topologies/' + S.topo.id);
   await loadTopos(); S.topos.length ? openTopo(S.topos[0].id) : noTopo();
 });
@@ -805,18 +934,36 @@ $('#restoreFile').addEventListener('change', async (ev) => {
   ev.target.value = '';
 });
 $('#panelClose').addEventListener('click', () => select(null));
-$('#search').addEventListener('input', (ev) => { S.search = ev.target.value; applyHighlight(); });
-$('#search').addEventListener('keydown', (ev) => {
-  if (ev.key === 'Enter') {
-    const hits = [...S.nodes.values()].filter((n) => n._el.classList.contains('hit'));
-    if (hits.length) { fit(hits); if (hits.length === 1) select({ kind: 'node', id: hits[0].id }); }
-  }
-  if (ev.key === 'Escape') { ev.target.value = ''; S.search = ''; applyHighlight(); ev.target.blur(); }
+$('#search').addEventListener('input', (ev) => {
+  S.search = ev.target.value; SR.active = -1;
+  if (S.sel) S.sel = null, closePanel();  // иначе подсветка цепочки выбранного узла спрячет найденное
+  applyHighlight(); renderSearchList();
 });
+$('#search').addEventListener('focus', renderSearchList);
+$('#search').addEventListener('blur', () => $('#searchList').classList.add('hidden'));
+$('#search').addEventListener('keydown', (ev) => {
+  if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+    ev.preventDefault();
+    if (!SR.items.length) return;
+    const n = Math.min(SR.items.length, 60);
+    SR.active = ((SR.active + (ev.key === 'ArrowDown' ? 1 : -1)) % n + n) % n;
+    goSearchItem(SR.active);
+  }
+  if (ev.key === 'Enter') {
+    if (SR.active >= 0) goSearchItem(SR.active);
+    else if (SR.items.length === 1) goSearchItem(0);
+    else if (SR.items.length) fit(SR.items.map((x) => x.n));
+  }
+  if (ev.key === 'Escape') {
+    ev.target.value = ''; S.search = ''; SR.active = -1;
+    applyHighlight(); renderSearchList(); ev.target.blur();
+  }
+});
+window.addEventListener('resize', () => { if (!$('#searchList').classList.contains('hidden')) renderSearchList(); });
 
 window.addEventListener('keydown', (ev) => {
   if (ev.target.closest('input, textarea, select, dialog')) return;
-  if ((ev.key === 'Delete' || ev.key === 'Backspace') && S.sel) { ev.preventDefault(); deleteSel(); }
+  if ((ev.key === 'Delete' || ev.key === 'Backspace') && S.sel && canEdit()) { ev.preventDefault(); deleteSel(); }
   if (ev.key === 'Escape') select(null);
   if (ev.key === 'f' || ev.key === 'а') fit();
   if (ev.key === '/') { ev.preventDefault(); $('#search').focus(); }
@@ -824,7 +971,57 @@ window.addEventListener('keydown', (ev) => {
 
 window.addEventListener('resize', () => renderEdges());
 
+/* ------------------------------------------------------------ левое меню и ширина панели */
+
+const store = {
+  get: (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) { /* приватный режим */ } },
+};
+
+function setSide(collapsed) {
+  document.body.classList.toggle('side-collapsed', collapsed);
+  store.set('shm-side-collapsed', collapsed ? '1' : '');
+  setTimeout(renderEdges, 200);
+}
+$('#btnSide').addEventListener('click', () => setSide(!document.body.classList.contains('side-collapsed')));
+window.addEventListener('keydown', (ev) => {
+  if (ev.key === '[' && !ev.target.closest('input, textarea, select, dialog')) setSide(!document.body.classList.contains('side-collapsed'));
+});
+setSide(store.get('shm-side-collapsed') === '1');
+
+function setPanelW(w) {
+  w = Math.round(Math.max(300, Math.min(window.innerWidth * 0.75, w)));
+  document.documentElement.style.setProperty('--panel-w', w + 'px');
+  return w;
+}
+if (+store.get('shm-panel-w')) setPanelW(+store.get('shm-panel-w'));
+$('#panelResize').addEventListener('mousedown', (ev) => {
+  ev.preventDefault();
+  document.body.classList.add('resizing');
+  const move = (e) => setPanelW(window.innerWidth - e.clientX);
+  const up = (e) => {
+    document.body.classList.remove('resizing');
+    window.removeEventListener('mousemove', move);
+    window.removeEventListener('mouseup', up);
+    store.set('shm-panel-w', setPanelW(window.innerWidth - e.clientX));
+  };
+  window.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', up);
+});
+$('#panelResize').addEventListener('dblclick', () => { store.set('shm-panel-w', setPanelW(380)); });
+
+$('#btnLogout').addEventListener('click', async () => {
+  if (!await ask({ title: 'Выйти?', ok: 'Выйти' })) return;
+  await fetch('/api/logout', { method: 'POST' });
+  location.href = '/login.html';
+});
+
 (async function init() {
+  const me = await api('GET', 'me');
+  S.role = me.role;
+  document.body.classList.toggle('viewer', me.role !== 'admin');
+  $('#meLogin').textContent = me.login;
+  $('#meRole').textContent = me.role === 'admin' ? 'админ' : 'просмотр';
   applyView();
   await loadTopos();
   const last = +localStorage.getItem('shm-topo-last');

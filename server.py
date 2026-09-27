@@ -5,12 +5,15 @@
 Только стандартная библиотека Python.
 """
 import argparse
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
 import re
 import sqlite3
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
 
@@ -79,6 +82,75 @@ EVENT_NAMES = {
 
 NODE_COLS = ('type', 'key', 'title', 'subtitle', 'content', 'meta', 'x', 'y')
 EDGE_COLS = ('source_id', 'target_id', 'kind', 'label', 'meta')
+
+
+def load_env(path):
+    """Минимальный парсер .env: KEY=value, # комментарии, кавычки. Переменные окружения важнее файла."""
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            k, v = k.strip(), v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+                v = v[1:-1]
+            os.environ.setdefault(k, v)
+
+
+def env(*names, default=''):
+    for n in names:  # допускаем и ADMIN_PASS, и admin_pass
+        for k in (n.upper(), n.lower()):
+            if os.environ.get(k):
+                return os.environ[k]
+    return default
+
+
+class Auth:
+    COOKIE = 'shm_topo'
+    TTL = 30 * 86400
+
+    def __init__(self):
+        self.users = {}
+        admin_login, admin_pass = env('ADMIN_LOGIN', default='admin'), env('ADMIN_PASS')
+        user_login, user_pass = env('USER_LOGIN'), env('USER_PASS')
+        if admin_pass:
+            self.users[admin_login] = (admin_pass, 'admin')
+        if user_login and user_pass:
+            self.users[user_login] = (user_pass, 'viewer')
+        # ключ подписи сессий: SESSION_SECRET или производный от паролей (смена пароля = разлогин всех)
+        seed = env('SESSION_SECRET') or json.dumps(sorted((k, v[0]) for k, v in self.users.items()))
+        self.key = hashlib.sha256(('shm-topology:' + seed).encode()).digest()
+        self.fails = {}
+
+    def check(self, login, password):
+        u = self.users.get(login)
+        ok = bool(u) and hmac.compare_digest(u[0].encode(), (password or '').encode())
+        return (u[1] if ok else None)
+
+    def sign(self, login, role):
+        exp = int(time.time()) + self.TTL
+        payload = f'{login}|{role}|{exp}'
+        sig = hmac.new(self.key, payload.encode(), hashlib.sha256).hexdigest()
+        return f'{payload}|{sig}'
+
+    def verify(self, token):
+        try:
+            login, role, exp, sig = token.rsplit('|', 3)
+        except (AttributeError, ValueError):
+            return None
+        good = hmac.new(self.key, f'{login}|{role}|{exp}'.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(good, sig) or int(exp) < time.time():
+            return None
+        u = self.users.get(login)
+        if not u or u[1] != role:  # пользователя убрали из .env или сменили роль
+            return None
+        return {'login': login, 'role': role}
+
+
+AUTH = None
 
 
 def db():
@@ -484,18 +556,76 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self.route('DELETE')
 
+    def session(self):
+        from http.cookies import SimpleCookie
+        c = SimpleCookie(self.headers.get('Cookie') or '')
+        return AUTH.verify(c[Auth.COOKIE].value) if Auth.COOKIE in c else None
+
+    def set_cookie(self, value, max_age):
+        secure = '; Secure' if (self.headers.get('X-Forwarded-Proto') == 'https') else ''
+        return f'{Auth.COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}'
+
+    def redirect(self, to):
+        self.send_response(302)
+        self.send_header('Location', to)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+    PUBLIC_STATIC = ('/login.html', '/style.css', '/login.js')
+
     def route(self, method):
         path = unquote(urlparse(self.path).path)
         try:
+            if path == '/api/login' and method == 'POST':
+                return self.login()
+            if path == '/api/logout':
+                self.send_response(200)
+                self.send_header('Set-Cookie', self.set_cookie('', 0))
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', '2')
+                self.end_headers()
+                return self.wfile.write(b'{}')
+            me = self.session()
             if path.startswith('/api/'):
+                if not me:
+                    return self.send_json({'error': 'нужен вход'}, 401)
+                if path == '/api/me':
+                    return self.send_json(me)
+                # просмотр: читать и двигать узлы (сохранять позиции) можно, остальное — только админу
+                moving = method == 'POST' and re.fullmatch(r'/api/topologies/\d+/positions', path)
+                if method != 'GET' and me['role'] != 'admin' and not moving:
+                    return self.send_json({'error': 'только просмотр'}, 403)
                 return self.api(method, path[5:].strip('/').split('/'))
             if method == 'GET':
+                if path in self.PUBLIC_STATIC:
+                    return self.static(path)
+                if not me:
+                    return self.redirect('/login.html')
                 return self.static(path)
             self.send_json({'error': 'not found'}, 404)
         except Exception as e:  # noqa
             import traceback
             traceback.print_exc()
             self.send_json({'error': str(e)}, 500)
+
+    def login(self):
+        ip = self.headers.get('X-Forwarded-For', self.client_address[0]).split(',')[0].strip()
+        b = self.body()
+        role = AUTH.check((b.get('login') or '').strip(), b.get('password') or '')
+        if not role:
+            # против перебора: пауза растёт с числом ошибок с этого IP
+            n = AUTH.fails.get(ip, 0) + 1
+            AUTH.fails[ip] = n
+            time.sleep(min(5, 0.5 * n))
+            return self.send_json({'error': 'Неверный логин или пароль'}, 401)
+        AUTH.fails.pop(ip, None)
+        body = json.dumps({'role': role}).encode()
+        self.send_response(200)
+        self.send_header('Set-Cookie', self.set_cookie(AUTH.sign(b['login'].strip(), role), Auth.TTL))
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def static(self, path):
         if path in ('/', ''):
@@ -647,16 +777,22 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global DB_PATH
+    global DB_PATH, AUTH
+    load_env(os.environ.get('SHM_TOPO_ENV') or os.path.join(BASE, '.env'))
+    DB_PATH = os.environ.get('SHM_TOPO_DB') or DB_PATH
     ap = argparse.ArgumentParser()
     ap.add_argument('--port', type=int, default=int(os.environ.get('SHM_TOPO_PORT') or 8765))
     ap.add_argument('--host', default=os.environ.get('SHM_TOPO_HOST') or '127.0.0.1')
     ap.add_argument('--db', default=DB_PATH)
     a = ap.parse_args()
+    AUTH = Auth()
+    if not AUTH.users:
+        raise SystemExit('Не задан ADMIN_PASS (и/или USER_LOGIN + USER_PASS) — заполните .env, см. .env.example')
     DB_PATH = os.path.abspath(a.db)
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     init_db()
-    print(f'SHM Topology: http://{a.host}:{a.port}  (db: {DB_PATH})')
+    roles = ', '.join(f'{k} ({v[1]})' for k, v in AUTH.users.items())
+    print(f'SHM Topology: http://{a.host}:{a.port}  (db: {DB_PATH}; пользователи: {roles})')
     ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()
 
 
