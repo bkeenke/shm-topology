@@ -223,3 +223,7 @@ body.resizing iframe, body.resizing #canvas { pointer-events: none; }
 .sl-field { color: var(--muted); }
 .search-list mark { background: rgba(245,213,71,.3); color: #fff; border-radius: 2px; padding: 0 1px; }
 .sl-more { font-size: 11.5px; color: var(--muted); padding: 6px 8px; }
+
+.badge.muted-b { background: rgba(139,147,164,.1); color: var(--muted); border: 1px dashed rgba(139,147,164,.4); }
+.node.unused { opacity: .6; }
+.node.unused:hover, .node.unused.sel { opacity: 1; }

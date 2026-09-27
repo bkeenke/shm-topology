@@ -131,6 +131,7 @@ function nodeHTML(n) {
   let body = '';
   if (m.src_changed) body += '<div class="badge warn">⚠ текст в шаблоне изменился — открой узел</div>';
   if (m.stale) body += '<div class="badge bad">✖ больше нет в шаблоне</div>';
+  if (m.unused_event) body += `<div class="badge muted-b">⚪ событие ${esc(m.unused_event)} не вызывает этот шаблон — сообщение не уходит</div>`;
   body += condBox('Выполняется, если:', m.guards, 'guard');
   body += condBox('Когда:', m.when);
   if ((m.when_tech || []).length) body += `<div class="tech">+ ${m.when_tech.length} тех. ${plural(m.when_tech.length, 'проверка', 'проверки', 'проверок')}</div>`;
@@ -170,7 +171,7 @@ function renderNode(n) {
     nodesEl.appendChild(el);
   }
   const m = n.meta || {};
-  el.className = `node t-${n.type}${m.missing ? ' missing' : ''}${m.stale ? ' stale' : ''}${m.recipient === 'group' ? ' group' : ''}`;
+  el.className = `node t-${n.type}${m.missing ? ' missing' : ''}${m.stale ? ' stale' : ''}${m.recipient === 'group' ? ' group' : ''}${m.unused_event ? ' unused' : ''}`;
   el.style.setProperty('--c', (TYPES[n.type] || TYPES.note).color);
   el.style.left = (n.x || 0) + 'px';
   el.style.top = (n.y || 0) + 'px';

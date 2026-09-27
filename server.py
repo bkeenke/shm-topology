@@ -207,8 +207,8 @@ def recipient(profile):
 class Builder:
     """Строит граф в памяти: узлы и связи со стабильными uid, чтобы повторный импорт мог обновлять схему."""
 
-    def __init__(self, lib, depth=6):
-        self.lib, self.depth = lib, depth
+    def __init__(self, lib, depth=6, prune=False):
+        self.lib, self.depth, self.prune = lib, depth, prune
         self.nodes = {}          # uid -> поля
         self.edges = {}          # uid -> {s, t, kind, label, meta}
         self._info = {}
@@ -353,8 +353,32 @@ class Builder:
             tn = self.template(c, level=level + 1)
             self.edge(nid, tn, 'calls', 'вызывает')
 
+    def mark_unused_events(self):
+        """Вариант сообщения «при событии X», а событие X к этому шаблону не привязано — пометить."""
+        handlers = {}
+        for e in self.edges.values():
+            if e['kind'] == 'handler' and e['s'].startswith('event:'):
+                handlers.setdefault(e['t'], set()).add(e['s'].rsplit(':', 1)[1].lower())
+        for e in self.edges.values():
+            if e['kind'] != 'sends' or e['s'] not in handlers:
+                continue
+            nd = self.nodes.get(e['t'])
+            if not nd:
+                continue
+            want = [re.match(r'событие (\S+)', w).group(1) for w in nd['meta'].get('when', [])
+                    if re.match(r'событие (?!не )(\S+)', w)]
+            missing = [w for w in want if w.lower() not in handlers[e['s']]]
+            if want and len(missing) == len(want):
+                nd['meta']['unused_event'] = ', '.join(missing)
+        if self.prune:  # схема одного события: варианты для чужих событий не нужны
+            drop = {u for u, n in self.nodes.items() if n['meta'].get('unused_event')}
+            for u in drop:
+                del self.nodes[u]
+            self.edges = {k: e for k, e in self.edges.items() if e['s'] not in drop and e['t'] not in drop}
+
     # --- запись в БД
     def write(self, con, tid):
+        self.mark_unused_events()
         """Создаёт или обновляет узлы/связи топологии. Ручные узлы и связи не трогает."""
         stats = {'added': 0, 'updated': 0, 'stale': 0}
         old = {r['uid']: row(r) for r in con.execute('SELECT * FROM nodes WHERE topology_id=? AND uid IS NOT NULL', (tid,))}
@@ -514,7 +538,7 @@ def do_import(payload):
             if is_new:
                 tid = con.execute('INSERT INTO topologies (name, description, source) VALUES (?,?,?)',
                                   (title, f'Событий: {len(evs)}, публичных шаблонов: {len(pubs)}', source)).lastrowid
-            b = Builder(lib, depth)
+            b = Builder(lib, depth, prune=split)
             for ev in evs:
                 b.event(ev)
             for p in pubs:

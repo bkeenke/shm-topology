@@ -280,7 +280,7 @@ def parse_tg_sends(src, vs=None):
         method = mm.group(1) if mm else 'sendMessage'
         if method in NO_CONTENT:
             continue
-        text = ''
+        text, variants = '', None
         tm = re.search(KEY('(?:text|caption)'), region)
         if tm:
             val, is_lit = _value_at(region, tm.end())
@@ -288,6 +288,7 @@ def parse_tg_sends(src, vs=None):
             var = inner.group(1) if inner else (None if is_lit else (re.fullmatch(r'\w+', val) or [None])[0])
             if var and block_text(var, pos) is not None:
                 text = block_text(var, pos)
+                variants = text_variants(text)
             elif is_lit:
                 text = val.replace('\\n', '\n')
             else:
@@ -301,15 +302,137 @@ def parse_tg_sends(src, vs=None):
         profile = None
         if prof:
             profile = _resolve_str(vs, prof, pos, prof)
-        out.append({
-            'method': method,
-            'text': humanize_tt(text),
-            'media': media,
-            'buttons': parse_keyboard(region),
-            'profile': profile,
-            'pos': pos,
-        })
+        buttons = parse_keyboard(region)
+        for extra, vtext in (variants or [([], text)]):
+            out.append({
+                'method': method,
+                'text': humanize_tt(vtext),
+                'media': media,
+                'buttons': buttons,
+                'profile': profile,
+                'extra_when': extra,
+                'variant': bool(variants),
+                'pos': pos,
+            })
     return out
+
+
+# ---------------------------------------------------------------- варианты текста одного сообщения
+
+DISPATCH_RE = re.compile(r'\b(event_name|us\.status|us\.status_before|remna_action|request\.params\.\w+|cmd)\b')
+MAX_VARIANTS = 16
+
+
+def _text_tree(src):
+    """Дерево TEXT-блока: текст, цепочки IF/ELSIF/ELSE (с позициями), STOP. Прочие блоки — как текст."""
+    root = {'kind': 'seq', 'children': []}
+    stack = [root]
+    pos = 0
+
+    def add(x):
+        top = stack[-1]
+        (top['branches'][-1]['children'] if top['kind'] == 'chain' else top['children']).append(x)
+
+    for d in DIRECTIVE_RE.finditer(src):
+        if stack[-1]['kind'] != 'raw' and d.start() > pos:
+            add(('text', src[pos:d.start()]))
+        stmts = _stmts(d.group(1))
+        st = stmts[0] if len(stmts) == 1 else ''
+        head = st.split(None, 1)[0] if st else ''
+        rest = st[len(head):].strip()
+        top = stack[-1]
+        if top['kind'] == 'raw':  # внутри FOR/другого блока — считаем только вложенность
+            if head in Flow.OPEN or re.match(r'^\w+\s*=\s*(BLOCK|PERL)\b', st):
+                top['depth'] += 1
+            elif head == 'END':
+                top['depth'] -= 1
+                if top['depth'] == 0:
+                    stack.pop()
+                    add(('text', src[top['start']:d.end()]))
+            pos = d.end()
+            continue
+        if head in ('IF', 'UNLESS'):
+            stack.append({'kind': 'chain', 'start': d.start(), 'branches': [
+                {'cond': rest, 'neg': head == 'UNLESS', 'children': []}]})
+        elif head == 'ELSIF' and top['kind'] == 'chain':
+            top['branches'].append({'cond': rest, 'neg': False, 'children': []})
+        elif head == 'ELSE' and top['kind'] == 'chain':
+            top['branches'].append({'cond': None, 'neg': False, 'children': []})
+        elif head == 'END' and top['kind'] == 'chain':
+            stack.pop()
+            top['end'] = d.end()
+            add(('chain', top))
+        elif head in ('STOP', 'RETURN') and not rest:
+            add(('stop', None))
+        elif head in Flow.OPEN or re.match(r'^\w+\s*=\s*(BLOCK|PERL)\b', st):
+            stack.append({'kind': 'raw', 'start': d.start(), 'depth': 1})
+        else:
+            add(('text', d.group(0)))
+        pos = d.end()
+    if pos < len(src):
+        add(('text', src[pos:]))
+    while len(stack) > 1:  # незакрытое — отдаём как есть
+        stack.pop()
+    return root, src
+
+
+def _branch_cond(chain, i):
+    br = chain['branches'][i]
+    if br['cond'] is not None:
+        return human_cond(br['cond'], br['neg'])
+    prior = [b['cond'] for b in chain['branches'][:i]]
+    if len(prior) == 1:
+        return human_cond(prior[0], not chain['branches'][0]['neg'])
+    return H('иначе (ни одно из условий выше)')
+
+
+def _only_stop(children):
+    items = [c for c in children if not (c[0] == 'text' and not c[1].strip())]
+    return bool(items) and all(c[0] == 'stop' for c in items)
+
+
+def _variants(children, src):
+    """-> [(условия, текст)] ; None если вариантов слишком много."""
+    out = [([], '')]
+    for kind, val in children:
+        if kind == 'text':
+            out = [(c, t + val) for c, t in out]
+        elif kind == 'stop':
+            return []  # эта ветка сообщение не отправляет
+        else:
+            ch = val
+            raw = src[ch['start']:ch.get('end', ch['start'])]
+            conds = ' '.join(b['cond'] or '' for b in ch['branches'])
+            # `IF x STOP END` — это условие, а не текст
+            if len(ch['branches']) == 1 and _only_stop(ch['branches'][0]['children']):
+                b = ch['branches'][0]
+                g = human_cond(b['cond'], not b['neg'])
+                out = [(c + [g], t) for c, t in out]
+                continue
+            dispatch = DISPATCH_RE.search(conds) or len(ch['branches']) >= 3
+            if not dispatch:
+                out = [(c, t + raw) for c, t in out]
+                continue
+            sub = []
+            for i, b in enumerate(ch['branches']):
+                bc = _branch_cond(ch, i)
+                vs = _variants(b['children'], src)
+                if vs is None:
+                    return None
+                sub += [([bc] + c, t) for c, t in vs]
+            out = [(c1 + c2, t1 + t2) for c1, t1 in out for c2, t2 in sub]
+            if len(out) > MAX_VARIANTS:
+                return None
+    return out
+
+
+def text_variants(raw):
+    """Разбивает TEXT-блок с ветвлением по событию/статусу на отдельные сообщения."""
+    root, src = _text_tree(raw)
+    vs = _variants(root['children'], src)
+    if not vs or len(vs) < 2:
+        return None
+    return vs
 
 
 def concat_text(expr):
@@ -530,6 +653,7 @@ def analyze(src):
 
     def place(item):
         conds, dead = flow.at(item.pop('pos'))
+        conds = conds + item.pop('extra_when', [])
         item['when'], item['when_tech'] = _split_when(conds)
         return not dead
 
