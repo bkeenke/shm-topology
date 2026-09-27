@@ -32,6 +32,9 @@
         <option value="tg_message" selected>💬 TG-сообщение</option>
         <option value="email">✉️ Письмо</option>
         <option value="job">⏱ Задача</option>
+        <option value="push">📱 Push</option>
+        <option value="bot_cmd">🤖 Команда бота</option>
+        <option value="entry">🌐 Вход</option>
         <option value="note">📝 Заметка</option>
       </select>
       <button id="btnAdd" class="btn small">＋ Узел</button>
@@ -70,6 +73,9 @@
       <span><i class="lg tg_message"></i>TG</span>
       <span><i class="lg email"></i>Письмо</span>
       <span><i class="lg job"></i>Задача</span>
+      <span><i class="lg push"></i>Push</span>
+      <span><i class="lg bot_cmd"></i>Бот</span>
+      <span><i class="lg entry"></i>Вход</span>
       <span><i class="lg note"></i>Заметка</span>
       <span class="sep"></span>
       <span><i class="le handler"></i>обработчик</span>
@@ -103,10 +109,19 @@
       <input id="impEvents" type="file" accept=".json,application/json">
     </label>
     <div id="impInfo" class="muted small"></div>
-    <label class="field">Название
-      <input id="impName" class="input" value="Все события">
-    </label>
-    <label class="check"><input id="impSplit" type="checkbox"> Отдельная топология на каждое событие (registered, payment, …)</label>
+    <div class="field">Публичные шаблоны (webhook / API) — добавить на схему как входы
+      <div id="impPublic" class="publist muted small">выберите источники…</div>
+    </div>
+    <label class="check"><input id="impSplit" type="checkbox"> Отдельная схема на каждое событие и публичный шаблон</label>
+    <div id="impSingle" class="row2">
+      <label class="field">Куда
+        <select id="impTarget" class="input"></select>
+      </label>
+      <label class="field">Название новой схемы
+        <input id="impName" class="input" value="Все события">
+      </label>
+    </div>
+    <label id="impUpdateWrap" class="check hidden"><input id="impUpdate" type="checkbox" checked> Обновлять уже созданные схемы событий (позиции, заметки и ручные правки сохраняются)</label>
     <div class="dlg-actions">
       <button value="cancel" class="btn ghost">Отмена</button>
       <button id="impGo" value="default" class="btn primary">Построить</button>

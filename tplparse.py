@@ -57,7 +57,12 @@ def _match_bracket(s, pos, open_ch, close_ch):
 
 
 def _stmts(directive_body):
-    return [s.strip() for s in directive_body.split(';') if s.strip()]
+    out = []
+    for st in directive_body.split(';'):
+        st = re.sub(r'\s#.*$', '', st.strip(), flags=re.S).strip()  # `END #TEXT` — хвостовой комментарий
+        if st:
+            out.append(st)
+    return out
 
 
 def _is_opener(stmt):
@@ -138,6 +143,11 @@ def html_to_text(src):
     return '\n'.join(out).strip()
 
 
+def KEY(k):
+    """Ключ хеша в любом синтаксисе: `key = `, `key => `, `"key": ` (JSON)."""
+    return r'["\']?\b' + k + r'\b["\']?\s*(?:=>|=|:)\s*'
+
+
 def _value_at(s, pos):
     """Значение выражения после `key =` начиная с pos: строковый литерал или выражение до конца строки/запятой."""
     s2 = s[pos:].lstrip()
@@ -175,7 +185,7 @@ def _expr(s):
 
 
 def parse_keyboard(region):
-    m = re.search(r'\b(inline_keyboard|keyboard)\s*=\s*\[', region)
+    m = re.search(KEY('(?:inline_keyboard|keyboard)') + r'\[', region)
     if not m:
         return []
     start = m.end() - 1
@@ -210,16 +220,16 @@ def parse_keyboard(region):
 
 
 def _parse_button(obj):
-    tm = re.search(r'\btext\s*=\s*', obj)
+    tm = re.search(KEY('text'), obj)
     if not tm:
         return None
-    text, _ = _value_at(obj, tm.end())
-    btn = {'text': text}
+    text, lit = _value_at(obj, tm.end())
+    btn = {'text': humanize_tt(text if lit else concat_text(text))}
     for key in ('callback_data', 'url', 'web_app', 'switch_inline_query', 'login_url', 'copy_text', 'pay'):
-        km = re.search(r'\b' + key + r'\s*=\s*', obj)
+        km = re.search(KEY(key), obj)
         if km:
             if key == 'web_app':
-                um = re.search(r'\burl\s*=\s*', obj[km.end():])
+                um = re.search(KEY('url'), obj[km.end():])
                 val, _ = _value_at(obj[km.end():], um.end()) if um else ('', False)
             else:
                 val, _ = _value_at(obj, km.end())
@@ -229,44 +239,163 @@ def _parse_button(obj):
     return btn
 
 
-def parse_tg_sends(src):
-    blocks = find_blocks(src)
+NO_CONTENT = ('deleteMessage', 'answerCallbackQuery', 'pinChatMessage', 'editMessageReplyMarkup', 'sendChatAction')
+JSON_SEND_RE = re.compile(r'"(' + '|'.join(TG_METHODS) + r')"\s*:\s*\{')
+TG_API_RE = re.compile(r'\btg_api\s*\(')
+
+
+def _send_regions(src):
+    """-> [(pos, region, profile_expr|None)] для всех видов отправки в Telegram."""
     out = []
-    for m in TG_SEND_RE.finditer(src):
-        p = m.end() - 1
-        end = _match_bracket(src, p, '(', ')')
-        region = src[p + 1:end]
+    for m in re.finditer(r'telegram(?:\s*\.\s*profile\s*\(([^)]*)\))?\s*\.\s*send\s*\(', src):
+        end = _match_bracket(src, m.end() - 1, '(', ')')
+        out.append((m.start(), src[m.end():end], (m.group(1) or '').strip() or None))
+    for m in TG_API_RE.finditer(src):
+        end = _match_bracket(src, m.end() - 1, '(', ')')
+        out.append((m.start(), src[m.end():end], None))
+    for m in JSON_SEND_RE.finditer(src):
+        end = _match_bracket(src, m.end() - 1, '{', '}')
+        out.append((m.start(), m.group(1) + ' ' + src[m.end():end], None))
+    return sorted(out, key=lambda x: x[0])
+
+
+def _resolve_str(vs, expr, pos, default=None):
+    if not expr:
+        return default
+    r = vs.resolve(_parse_val(expr), pos)
+    return r[1] if r and r[0] == 'str' else default
+
+
+def parse_tg_sends(src, vs=None):
+    vs = vs or Vars(src)
+    blocks = find_blocks(src)
+
+    def block_text(var, pos):
+        cands = [b for b in blocks if b[0] == var and b[2] <= pos] or [b for b in blocks if b[0] == var]
+        return cands[-1][3] if cands else None
+
+    out = []
+    for pos, region, prof in _send_regions(src):
         mm = re.search(r'\b(' + '|'.join(TG_METHODS) + r')\b', region)
         method = mm.group(1) if mm else 'sendMessage'
+        if method in NO_CONTENT:
+            continue
         text = ''
-        tm = re.search(r'\b(text|caption)\s*=\s*', region)
+        tm = re.search(KEY('(?:text|caption)'), region)
         if tm:
             val, is_lit = _value_at(region, tm.end())
-            if is_lit:
-                text = val
+            inner = re.fullmatch(r'\{\{-?\s*(\w+)[^}]*\}\}', val.strip()) if is_lit else None
+            var = inner.group(1) if inner else (None if is_lit else (re.fullmatch(r'\w+', val) or [None])[0])
+            if var and block_text(var, pos) is not None:
+                text = block_text(var, pos)
+            elif is_lit:
+                text = val.replace('\\n', '\n')
             else:
-                var = re.match(r'^(\w+)$', val)
-                if var:
-                    cands = [b for b in blocks if b[0] == var.group(1) and b[2] <= m.start()]
-                    if not cands:
-                        cands = [b for b in blocks if b[0] == var.group(1)]
-                    text = cands[-1][3] if cands else '{{ ' + val + ' }}'
-                else:
-                    text = '{{ ' + val + ' }}'
+                text = concat_text(val)
         media = ''
         for key in ('photo', 'document', 'video', 'animation'):
-            pm = re.search(r'\b' + key + r'\s*=\s*', region)
+            pm = re.search(KEY(key), region)
             if pm:
                 media = key + ': ' + _value_at(region, pm.end())[0]
                 break
+        profile = None
+        if prof:
+            profile = _resolve_str(vs, prof, pos, prof)
         out.append({
             'method': method,
             'text': humanize_tt(text),
             'media': media,
             'buttons': parse_keyboard(region),
-            'pos': m.start(),
+            'profile': profile,
+            'pos': pos,
         })
     return out
+
+
+def concat_text(expr):
+    """'Осталось: ' _ expire_str _ ' ₽'  ->  Осталось: {{ expire_str }} ₽"""
+    parts = _split_top(expr, (' _ ',))
+    out = []
+    for p in parts:
+        p = p.strip()
+        if p[:1] in '"\'' and p[-1:] == p[:1]:
+            out.append(p[1:-1].replace('\\n', '\n'))
+        else:
+            out.append('{{ ' + p + ' }}')
+    return ''.join(out)
+
+
+def parse_bot_calls(src, vs=None):
+    """telegram.bot('telegram_bot', '/cmd', [args]) -> команда бота."""
+    vs = vs or Vars(src)
+    out = []
+    arg = r"""(['"][^'"]*['"]|[A-Za-z_][\w.]*)"""
+    for m in re.finditer(r'telegram\s*\.\s*bot\s*\(\s*' + arg + r'\s*,\s*' + arg, src):
+        bot = _resolve_str(vs, m.group(1), m.start(), 'telegram_bot')
+        cmd = _resolve_str(vs, m.group(2), m.start())
+        if cmd:
+            out.append({'bot': bot, 'cmd': cmd, 'pos': m.start()})
+    return out
+
+
+def bot_case(src, cmd):
+    """Текст ветки `<% CASE '/cmd' %>` (или CASE [ '/a', '/b' ]) шаблона бота."""
+    marks = list(re.finditer(r'<%-?\s*(CASE|END)\b(.*?)-?%>', src, re.S))
+    for i, m in enumerate(marks):
+        if m.group(1) != 'CASE':
+            continue
+        vals = re.findall(r"""['"]([^'"]+)['"]""", m.group(2))
+        if cmd in vals:
+            end = marks[i + 1].start() if i + 1 < len(marks) else len(src)
+            return src[m.end():end]
+    return None
+
+
+def parse_push(src, vs=None):
+    """Happ push: PushNotificationForm = { title, body, link_for_open }."""
+    out = []
+    for m in re.finditer(KEY('PushNotificationForm') + r'\{', src):
+        end = _match_bracket(src, m.end() - 1, '{', '}')
+        obj = src[m.end():end]
+        f = {}
+        for k in ('title', 'body', 'link_for_open', 'type_push', 'expire_days'):
+            km = re.search(KEY(k), obj)
+            if km:
+                v, lit = _value_at(obj, km.end())
+                f[k] = v if lit else concat_text(v)
+        out.append({'kind': 'happ', 'title': humanize_tt(f.get('title', '')), 'text': humanize_tt(f.get('body', '')),
+                    'link': f.get('link_for_open', ''), 'push_type': f.get('type_push', ''), 'pos': m.start()})
+    return out
+
+
+def parse_actions(src):
+    acts = []
+    for m in re.finditer(KEY('action_type') + r"""['"]([\w-]+)['"]""", src):
+        acts.append('Happ: команда ' + m.group(1))
+    if re.search(r'\bexternalSquadUuid\s*=', src) and re.search(r'http\s*\.\s*patch', src):
+        acts.append('Remnawave: смена external squad')
+    for m in re.finditer(r'\b(us|user)\s*\.\s*set_settings\s*\(\s*\{\s*[\'"]?(\w+)', src):
+        acts.append(('услуга' if m.group(1) == 'us' else 'пользователь') + ': settings.' + m.group(2))
+    if re.search(r'storage\s*\.\s*save\s*\(', src):
+        acts.append('storage: сохранение')
+    seen, out = set(), []
+    for a in acts:
+        if a not in seen:
+            seen.add(a)
+            out.append(a)
+    return out
+
+
+def parse_entries(src):
+    """Публичный шаблон-диспетчер: `x = request.params.event` и ветки `x == 'значение'`."""
+    for m in re.finditer(r'\b(\w+)\s*=\s*request\.params\.(\w+)\s*(?:\}\}|;|\n)', src):
+        var, vals = m.group(1), []
+        for v in re.findall(r'\b' + var + r'\s*==\s*[\'"]([^\'"]+)[\'"]', src):
+            if v not in vals:
+                vals.append(v)
+        if vals:
+            return {'var': var, 'param': m.group(2), 'values': vals}
+    return None
 
 
 ASSIGN_RE = re.compile(
@@ -386,19 +515,30 @@ def parse_http(src):
     return sorted(set(out))
 
 
+def _split_when(conds):
+    # «A ИЛИ B ИЛИ C», за которым внутри идёт конкретное «A», — лишнее
+    conds = [c for i, c in enumerate(conds)
+             if not (' ИЛИ ' in c and any(x in c.split(' ИЛИ ') for x in conds[i + 1:]))]
+    return [c for c in conds if not getattr(c, 'tech', False)], [c for c in conds if getattr(c, 'tech', False)]
+
+
 def analyze(src):
     desc = first_comment(src)
     body = strip_comments(src)
     flow = Flow(body)
-    tg = []
-    for m in parse_tg_sends(body):
-        m['when'], dead = flow.at(m['pos'])
-        if not dead:
-            tg.append(m)
+    vs = Vars(body)
+
+    def place(item):
+        conds, dead = flow.at(item.pop('pos'))
+        item['when'], item['when_tech'] = _split_when(conds)
+        return not dead
+
+    tg = [m for m in parse_tg_sends(body, vs) if place(m)]
+    push = [m for m in parse_push(body, vs) if place(m)]
+    bots = [m for m in parse_bot_calls(body, vs) if place(m)]
     spool, seen = [], {}
     for j in parse_spool(body):
-        j['when'], dead = flow.at(j.pop('pos'))
-        if dead:
+        if not place(j):
             continue
         k = (j['template'], j['delay'], j['period'], j['delay_expr'])
         if k in seen:  # та же задача в другой ветке — объединяем условия
@@ -408,17 +548,27 @@ def analyze(src):
             continue
         seen[k] = j
         spool.append(j)
+    guards, guards_tech = _split_when(flow.root_guards)
     return {
-        'guards': flow.root_guards,
+        'guards': guards,
+        'guards_tech': guards_tech,
         'stops': [{'when': list(w)} for w, _ in flow.stops if w and not any(isinstance(x, tuple) for x in w)][:12],
         'description': desc,
         'tg': tg,
+        'push': push,
+        'bot_calls': bots,
         'spool': spool,
         'calls': parse_calls(body),
         'http': parse_http(body),
+        'actions': parse_actions(body),
+        'entries': parse_entries(body),
         'mail_send': bool(re.search(r'\bmail\w*\s*\.\s*send\s*\(', body)),
         'email_text': html_to_text(body) if not tg else '',
     }
+
+
+def has_actions(info):
+    return bool(info['tg'] or info['push'] or info['bot_calls'] or info['spool'] or info['calls'] or info['mail_send'])
 
 
 def human_seconds(sec):
@@ -441,6 +591,35 @@ STATUS_RU = {
     'ACTIVE': 'активна', 'BLOCK': 'заблокирована', 'REMOVED': 'удалена', 'NOT PAID': 'не оплачена',
     'INIT': 'создана', 'PROGRESS': 'в обработке', 'ERROR': 'ошибка',
 }
+REMNA_RU = {
+    'user.first_connected': 'первое подключение', 'user.not_connected': 'не подключился',
+    'user.limited': 'превышен лимит трафика', 'user.bandwidth_usage_threshold_reached': 'приближается к лимиту трафика',
+    'user_hwid_devices.added': 'добавлено устройство', 'user_hwid_devices.deleted': 'удалено устройство',
+    'user.revoked': 'ссылка подписки сброшена', 'user.expired': 'подписка истекла', 'user.disabled': 'пользователь отключён',
+    'user.enabled': 'пользователь включён', 'user.created': 'пользователь создан', 'user.deleted': 'пользователь удалён',
+    'user.modified': 'пользователь изменён', 'user.expires_in_24_hours': 'истекает через 24 ч',
+    'user.expires_in_48_hours': 'истекает через 48 ч', 'user.expires_in_72_hours': 'истекает через 72 ч',
+}
+EVENT_RU = {
+    'REGISTERED': 'регистрация', 'CREATE': 'создание услуги', 'ACTIVATE': 'активация', 'BLOCK': 'блокировка',
+    'REMOVE': 'удаление', 'PROLONGATE': 'продление', 'PAYMENT': 'платёж', 'BONUS': 'бонус', 'CHANGED': 'смена статуса',
+    'FORECAST': 'прогноз оплаты', 'CHANGED_TARIFF': 'смена тарифа', 'NOT_ENOUGH_MONEY': 'не хватает денег',
+}
+
+
+class H(str):
+    """Строка условия на русском; tech=True — техническая проверка (сворачивается)."""
+
+    def __new__(cls, text, tech=False):
+        o = str.__new__(cls, text)
+        o.tech = tech
+        return o
+
+
+def T(text):
+    return H(text, True)
+
+
 _OPS_NEG = {'==': '!=', '!=': '==', 'eq': 'ne', 'ne': 'eq', '>': '<=', '<': '>=', '>=': '<', '<=': '>'}
 
 
@@ -482,6 +661,11 @@ def _strip_parens(s):
 
 
 def human_atom(a, neg=False):
+    r = _atom(a, neg)
+    return r if isinstance(r, H) else H(r)
+
+
+def _atom(a, neg=False):
     a = _strip_parens(a)
     while a.startswith('!') or a.upper().startswith('NOT '):
         a = _strip_parens(a[1:] if a.startswith('!') else a[4:])
@@ -512,9 +696,21 @@ def human_atom(a, neg=False):
             return f'сумма платежа {op} {val}'
         if lhs == 'user.id' and val.isdigit():
             return ('пользователь #' if eq else 'пользователь не #') + val
+        if lhs == 'event_name' and op in ('==', '!=', 'eq', 'ne'):
+            return ('событие ' if eq else 'событие не ') + val.lower() + (f' ({EVENT_RU[val]})' if val in EVENT_RU else '')
+        if val in REMNA_RU and op in ('==', '!=', 'eq', 'ne'):
+            return ('Remnawave: ' if eq else 'Remnawave не: ') + REMNA_RU[val]
+        if lhs == 'user.settings.email_verified':
+            return 'email подтверждён' if (eq and val == '1') or (not eq and val == '0') else 'email не подтверждён'
+        m2 = re.fullmatch(r'(us|user)\.settings\.(\w+)', lhs)
+        if m2 and op in ('==', '!=', 'eq', 'ne'):
+            who = 'у услуги' if m2.group(1) == 'us' else 'у пользователя'
+            return f'{who} {m2.group(2)} {"=" if eq else "≠"} {val}'
+        if lhs in ('user.discount', 'user.balance', 'bonus.bonus'):
+            return {'user.discount': 'скидка', 'user.balance': 'баланс', 'bonus.bonus': 'бонус'}[lhs] + f' {op} {val}'
         if rhs == 'NULL' or rhs == "''":
-            return ('не задано ' if eq else 'задано ') + lhs
-        return f'{lhs} {op} {rhs}'
+            return T(('не задано ' if eq else 'задано ') + lhs)
+        return T(f'{lhs} {op} {rhs}')
     simple = {
         'user.has_payments': ('есть платежи', 'нет платежей'),
         'user.us.has_services_block': ('есть услуги в блоке', 'нет услуг в блоке'),
@@ -542,12 +738,18 @@ def human_atom(a, neg=False):
         who = 'у услуги' if m.group(1) == 'us' else 'у пользователя'
         return f'{who} {"нет флага" if neg else "есть флаг"} {m.group(2)}'
     if neg and re.fullmatch(r'[\w.]+', a):
-        return 'нет ' + a
-    return ('НЕ ' if neg else '') + re.sub(r'\s+', ' ', a)
+        return T('нет ' + a)
+    return T(('НЕ ' if neg else '') + re.sub(r'\s+', ' ', a))
 
 
 def human_cond(c, neg=False):
     c = _strip_parens(re.sub(r'\s+', ' ', c))
+    atoms = [x for o in _split_top(c, ('||', ' or ', ' OR ')) for x in _split_top(_strip_parens(o), ('&&', ' and ', ' AND '))]
+    tech = all(human_atom(x).tech for x in atoms)
+    return H(_human_cond(c, neg), tech)
+
+
+def _human_cond(c, neg=False):
     ors = _split_top(c, ('||', ' or ', ' OR '))
     if len(ors) > 1 and not neg:
         # (A && B) || (A && C)  ->  A, B или C
@@ -609,16 +811,16 @@ class Flow:
                     elif len(pr) == 1:
                         top['cond'] = human_cond(pr[0], True)
                     else:
-                        top['cond'] = 'иначе (ни одно из условий выше)'
+                        top['cond'] = H('иначе (ни одно из условий выше)')
                     top['guards'] = []
                 elif head in ('FOR', 'FOREACH'):
                     m = re.match(r'(\w+)\s+(?:IN|=)\s+(.+)', rest)
-                    stack.append({'kind': 'FOR', 'cond': f'для каждого {m.group(1)} из {m.group(2).strip()[:60]}' if m else None,
+                    stack.append({'kind': 'FOR', 'cond': T(f'для каждого {m.group(1)} из {m.group(2).strip()[:60]}') if m else None,
                                   'prior': [], 'guards': []})
                 elif head == 'SWITCH':
                     stack.append({'kind': 'SWITCH', 'cond': None, 'subj': rest, 'prior': [], 'guards': []})
                 elif head == 'CASE' and top['kind'] == 'SWITCH':
-                    top['cond'] = f'{top["subj"]} = {rest}' if rest and rest != 'DEFAULT' else f'{top["subj"]}: остальные случаи'
+                    top['cond'] = H(f'{top["subj"]} = {rest}' if rest and rest != 'DEFAULT' else f'{top["subj"]}: остальные случаи')
                 elif head == 'BLOCK' and rest:
                     name = rest.split()[0]
                     stack.append({'kind': 'NBLOCK', 'cond': None, 'name': name, 'start': d.start(), 'prior': [], 'guards': []})

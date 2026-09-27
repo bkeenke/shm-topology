@@ -9,6 +9,9 @@ const TYPES = {
   tg_message: { icon: '💬', name: 'TG-сообщение', color: 'var(--c-tg_message)' },
   email: { icon: '✉️', name: 'Письмо', color: 'var(--c-email)' },
   job: { icon: '⏱', name: 'Задача', color: 'var(--c-job)' },
+  push: { icon: '📱', name: 'Push', color: 'var(--c-push)' },
+  bot_cmd: { icon: '🤖', name: 'Команда бота', color: 'var(--c-bot_cmd)' },
+  entry: { icon: '🌐', name: 'Вход (webhook/API)', color: 'var(--c-entry)' },
   note: { icon: '📝', name: 'Заметка', color: 'var(--c-note)' },
 };
 const EDGE_KINDS = {
@@ -64,10 +67,11 @@ async function openTopo(id) {
   $('#empty').classList.add('hidden');
   closePanel();
   renderAll();
-  const needLayout = [...S.nodes.values()].some((n) => n.x == null);
-  if (needLayout) {
+  const missing = [...S.nodes.values()].filter((n) => n.x == null);
+  if (missing.length === S.nodes.size && missing.length) {
     autoLayout(true);
   } else {
+    if (missing.length) await placeNew(missing);
     const v = JSON.parse(localStorage.getItem('shm-view-' + id) || 'null');
     if (v) { S.view = v; applyView(); } else initialView();
   }
@@ -83,30 +87,45 @@ function noTopo() {
 
 /* ------------------------------------------------------------ рендер */
 
+function condBox(title, list, cls = '') {
+  return list && list.length ? `<div class="when ${cls}"><b>${title}</b>${list.map((w) => `<div>▸ ${esc(w)}</div>`).join('')}</div>` : '';
+}
+
 function nodeHTML(n) {
   const T = TYPES[n.type] || TYPES.note;
   const m = n.meta || {};
   let body = '';
+  if (m.src_changed) body += '<div class="badge warn">⚠ текст в шаблоне изменился — открой узел</div>';
+  if (m.stale) body += '<div class="badge bad">✖ больше нет в шаблоне</div>';
+  body += condBox('Выполняется, если:', m.guards, 'guard');
+  body += condBox('Когда:', m.when);
+  if ((m.when_tech || []).length) body += `<div class="tech">+ ${m.when_tech.length} тех. ${plural(m.when_tech.length, 'проверка', 'проверки', 'проверок')}</div>`;
   const text = n.content || '';
   if (text) body += `<div class="txt${text.split('\n').length > 9 || text.length > 420 ? ' clip' : ''}">${esc(text.slice(0, 900))}</div>`;
   if (m.buttons && m.buttons.length) {
     body += '<div class="kb">' + m.buttons.map((row) => '<div class="row">' + row.map((b) =>
       `<span class="b ${esc(b.type || '')}" title="${esc((b.type || '') + ': ' + (b.action || ''))}">${esc(b.text)}</span>`).join('') + '</div>').join('') + '</div>';
   }
-  const whenList = (m.when || []).filter(Boolean);
-  if (whenList.length) body = `<div class="when"><b>Когда:</b>${whenList.map((w) => `<div>▸ ${esc(w)}</div>`).join('')}</div>` + body;
-  if (m.guards && m.guards.length) body = `<div class="when guard"><b>Выполняется, если:</b>${m.guards.map((w) => `<div>▸ ${esc(w)}</div>`).join('')}</div>` + body;
+  if (n.type === 'push' && m.link) body += `<div class="kb"><div class="row"><span class="b url" title="${esc(m.link)}">открыть ссылку</span></div></div>`;
+  if ((m.actions || []).length) body += `<div class="acts">${m.actions.map((a) => `<div>⚙ ${esc(a)}</div>`).join('')}</div>`;
   let sub = n.subtitle || '';
   if (n.type === 'email' && m.subject && m.subject !== n.title) sub = 'Тема: ' + m.subject;
   const flags = [];
-  if (m.missing) flags.push('нет исходника в библиотеке');
+  if (m.missing) flags.push(n.type === 'bot_cmd' ? 'CASE не найден в шаблоне бота' : 'нет исходника в библиотеке');
   if (m.http && m.http.length) flags.push('HTTP×' + m.http.length);
   if (m.stops && m.stops.length) flags.push('⛔ STOP×' + m.stops.length);
-  return `<div class="hd"><span class="ic">${T.icon}</span><div><div class="tag">${T.name}</div><div class="tt">${esc(n.title || n.key || '(без названия)')}</div></div></div>
+  if (m.public) flags.push('🌐 публичный');
+  const tag = n.type === 'tg_message' ? 'TG-сообщение' : T.name;
+  return `<div class="hd"><span class="ic">${T.icon}</span><div><div class="tag">${tag}</div><div class="tt">${esc(n.title || n.key || '(без названия)')}</div></div></div>
     ${sub ? `<div class="st">${esc(sub)}</div>` : ''}
     ${body ? `<div class="bd">${body}</div>` : ''}
     ${flags.length ? `<div class="flag">${esc(flags.join(' · '))}</div>` : ''}
     <div class="port" title="Потяните, чтобы связать"></div>`;
+}
+
+function plural(n, one, few, many) {
+  const a = n % 10, b = n % 100;
+  return a === 1 && b !== 11 ? one : a >= 2 && a <= 4 && (b < 10 || b >= 20) ? few : many;
 }
 
 function renderNode(n) {
@@ -116,7 +135,8 @@ function renderNode(n) {
     el.dataset.id = n.id;
     nodesEl.appendChild(el);
   }
-  el.className = `node t-${n.type}${n.meta && n.meta.missing ? ' missing' : ''}`;
+  const m = n.meta || {};
+  el.className = `node t-${n.type}${m.missing ? ' missing' : ''}${m.stale ? ' stale' : ''}${m.recipient === 'group' ? ' group' : ''}`;
   el.style.setProperty('--c', (TYPES[n.type] || TYPES.note).color);
   el.style.left = (n.x || 0) + 'px';
   el.style.top = (n.y || 0) + 'px';
@@ -133,7 +153,7 @@ function renderAll() {
 
 function box(n) {
   const el = n._el;
-  return { x: n.x || 0, y: n.y || 0, w: el ? el.offsetWidth : 260, h: el ? el.offsetHeight : 60 };
+  return { x: n.x ?? 0, y: n.y ?? 0, w: el ? el.offsetWidth : 260, h: el ? el.offsetHeight : 60 };
 }
 
 function edgeGeom(e) {
@@ -190,7 +210,7 @@ function renderEdges() {
     let lbl = '';
     if (e.label && w) lbl = `<text class="elabel" x="${g.mx}" y="${g.my - 16}" text-anchor="middle">${esc(e.label)}<tspan class="ewhen" x="${g.mx}" dy="13">${esc(w)}</tspan></text>`;
     else if (e.label || w) lbl = `<text class="elabel${e.label ? '' : ' only'}" x="${g.mx}" y="${g.my - 5}" text-anchor="middle">${esc(e.label || w)}</text>`;
-    out += `<g class="edge ${esc(e.kind || 'link')}${sel}" data-eid="${e.id}">
+    out += `<g class="edge ${esc(e.kind || 'link')}${sel}${e.meta && e.meta.stale ? ' stale' : ''}" data-eid="${e.id}">
       <path class="vis" d="${g.d}"/><path class="hit" d="${g.d}"/>${lbl}<title>${esc(whenFull(e.meta))}</title></g>`;
   });
   edgesSvg.innerHTML = defs + out;
@@ -277,6 +297,34 @@ async function autoLayout(andFit) {
   renderEdges();
   if (andFit === true) initialView(); else if (andFit !== false) fit();
   await api('POST', `topologies/${S.topo.id}/positions`, { items });
+}
+
+// новые узлы после повторного импорта ставим справа от узла, из которого они выходят
+async function placeNew(list) {
+  const slots = {};
+  const pending = new Set(list.map((n) => n.id));
+  for (let pass = 0; pass < 6 && pending.size; pass++) {
+    for (const n of list) {
+      if (!pending.has(n.id)) continue;
+      const e = [...S.edges.values()].find((e) => e.target_id === n.id && !pending.has(e.source_id) && S.nodes.has(e.source_id))
+        || [...S.edges.values()].find((e) => e.source_id === n.id && !pending.has(e.target_id) && S.nodes.has(e.target_id));
+      if (!e) continue;
+      const anchor = S.nodes.get(e.target_id === n.id ? e.source_id : e.target_id), b = box(anchor);
+      const k = slots[anchor.id] = (slots[anchor.id] || 0) + 1;
+      n.x = e.target_id === n.id ? b.x + b.w + 120 : b.x - 380;
+      n.y = b.y + (k - 1) * 160;
+      pending.delete(n.id);
+    }
+  }
+  if (pending.size) {
+    const b = bounds([...S.nodes.values()].filter((n) => n.x != null));
+    let y = isFinite(b.y2) ? b.y2 + 80 : 0;
+    list.filter((n) => pending.has(n.id)).forEach((n) => { n.x = isFinite(b.x1) ? b.x1 : 0; n.y = y; y += 180; });
+  }
+  list.forEach((n) => { n._el.style.left = n.x + 'px'; n._el.style.top = n.y + 'px'; });
+  renderEdges();
+  await api('POST', `topologies/${S.topo.id}/positions`, { items: list.map((n) => ({ id: n.id, x: n.x, y: n.y })) });
+  toast(`Новых узлов: ${list.length} — поставлены рядом со связанными`);
 }
 
 /* ------------------------------------------------------------ подсветка связей */
@@ -455,16 +503,24 @@ function showNodePanel(n) {
   $('#panelBody').innerHTML = `
     <div class="row2">
       <label class="field">Тип<select class="input" data-f="type">${typeOpts}</select></label>
-      <label class="field">Ключ / template_id<input class="input" data-f="key" value="${esc(n.key)}"></label>
+      <label class="field">${n.type === 'bot_cmd' ? 'Шаблон бота' : n.type === 'entry' ? 'Ветка / значение' : 'Ключ / template_id'}<input class="input" data-f="key" value="${esc(n.key)}"></label>
     </div>
     <label class="field">Название<input class="input" data-f="title" value="${esc(n.title)}"></label>
     ${n.type === 'email' ? `<label class="field">Тема письма<input class="input" data-m="subject" value="${esc(m.subject || '')}"></label>` : ''}
     <label class="field">Подзаголовок / описание<input class="input" data-f="subtitle" value="${esc(n.subtitle)}"></label>
     <label class="field">${n.type === 'tg_message' ? 'Текст сообщения' : n.type === 'email' ? 'Текст письма' : 'Содержимое / заметки'}
       <textarea class="input big" data-f="content">${esc(n.content)}</textarea></label>
-    ${n.type === 'tg_message' || (m.buttons && m.buttons.length) ? `<label class="field">Кнопки — строка = ряд, <code>||</code> между кнопками, <code>Текст => /callback</code> или <code>=> url:https://…</code>
+    ${n.type === 'tg_message' || (m.buttons && m.buttons.length) ? `<label class="field"><span>Кнопки — строка = ряд, <code>||</code> между кнопками, <code>Текст => /callback</code> или <code>=> url:https://…</code></span>
       <textarea class="input" data-buttons placeholder="💰 Баланс => /balance\n📖 Меню => /menu  ||  Канал => url:https://t.me/…">${esc(buttonsToText(m.buttons))}</textarea></label>` : ''}
+    ${m.src_changed ? `<div class="field changed">⚠ После твоей правки текст в шаблоне изменился. Новый вариант из шаблона:
+      <pre>${esc((m.src_new || {}).title || '')}\n\n${esc((m.src_new || {}).content || '')}${(m.src_new || {}).buttons ? '\n\n' + esc(buttonsToText(m.src_new.buttons)) : ''}</pre>
+      <div class="row2"><button class="btn small primary" data-act="accept">Взять из шаблона</button><button class="btn small" data-act="keep">Оставить мой</button></div></div>` : ''}
+    ${m.stale ? '<div class="field changed bad">✖ При последнем импорте этого узла в шаблонах уже не было. Можно удалить.</div>' : ''}
     ${(m.when || []).length ? `<div class="field">Когда срабатывает<ul class="conds">${m.when.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
+    ${(m.when_tech || []).length ? `<details class="src"><summary>Технические проверки (${m.when_tech.length})</summary><ul class="conds tech">${m.when_tech.concat(m.guards_tech || []).map((w) => `<li>${esc(w)}</li>`).join('')}</ul></details>` : ''}
+    ${(m.actions || []).length ? `<div class="field">Действия<ul class="conds">${m.actions.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
+    ${m.link ? `<div class="field">Ссылка push<div class="chips"><span class="chip">${esc(m.link)}</span></div></div>` : ''}
+    ${m.profile ? `<div class="field">Профиль Telegram<div class="chips"><span class="chip">${esc(m.profile)}</span></div></div>` : ''}
     ${(m.guards || []).length ? `<div class="field">Шаблон выполняется, только если<ul class="conds">${m.guards.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
     ${(m.stops || []).length ? `<div class="field">⛔ Остановка (STOP) — дальше не выполняется, если<ul class="conds stop">${m.stops.map((w) => `<li>${esc(w.join(', ') || 'всегда')}</li>`).join('')}</ul></div>` : ''}
     ${m.http && m.http.length ? `<div class="field">HTTP-запросы<div class="chips">${m.http.map((h) => `<span class="chip">${esc(h)}</span>`).join('')}</div></div>` : ''}
@@ -541,6 +597,10 @@ function bindPanel(obj, table) {
     } catch (e) { src.querySelector('pre').textContent = 'Шаблон не найден в библиотеке. Импортируйте папку с шаблонами.'; }
   });
   body.querySelector('[data-act="center"]')?.addEventListener('click', () => centerOn(obj));
+  ['accept', 'keep'].forEach((act) => body.querySelector(`[data-act="${act}"]`)?.addEventListener('click', async () => {
+    Object.assign(obj, await api('POST', `nodes/${obj.id}/${act}`, {}));
+    renderNode(obj); renderEdges(); applyHighlight(); select(S.sel);
+  }));
   body.querySelector('[data-act="del"]').addEventListener('click', () => deleteSel());
 }
 
@@ -588,7 +648,44 @@ function looksLikeEvents(data) {
   return Array.isArray(arr) && arr.some((e) => e && e.settings && e.settings.template_id) ? data : null;
 }
 
+let previewT = null;
+function schedulePreview() {
+  clearTimeout(previewT);
+  previewT = setTimeout(async () => {
+    if (!imp.events && !Object.keys(imp.templates).length && !imp.sql.length) return;
+    $('#impPublic').textContent = 'анализ…';
+    try {
+      const pv = await api('POST', 'import/preview', { events: imp.events, templates: imp.templates, settings: imp.settings, sql: imp.sql });
+      pv.public.sort((a, b) => (b.actions - a.actions) || a.name.localeCompare(b.name));
+      imp.publicList = pv.public;
+      $('#impPublic').innerHTML = pv.public.length ? pv.public.map((p) => `<label class="check" title="${esc(p.entries.join(', '))}">
+        <input type="checkbox" value="${esc(p.name)}"${p.actions ? ' checked' : ''}> ${esc(p.name)}
+        ${p.actions ? '<span class="pill">действия</span>' : ''}${p.entries.length ? `<span class="pill">${p.entries.length} вх.</span>` : ''}</label>`).join('')
+        : 'нет публичных шаблонов';
+      if (pv.sql) $('#impInfo').innerHTML += `<br>Из SQL: шаблонов <b>${pv.sql.templates}</b>, событий <b>${pv.sql.events}</b>`;
+    } catch (e) { $('#impPublic').textContent = 'ошибка анализа: ' + e.message; }
+  }, 250);
+}
+
+function fillTargets() {
+  const auto = S.topos.filter((t) => t.source);
+  const cur = S.topo && S.topo.source === 'import' ? S.topo.id : '';
+  $('#impTarget').innerHTML = '<option value="">➕ Новая схема</option>' + auto.map((t) =>
+    `<option value="${t.id}"${t.id === cur ? ' selected' : ''}>↻ Обновить: ${esc(t.name)}</option>`).join('');
+  syncImpMode();
+}
+
+function syncImpMode() {
+  const split = $('#impSplit').checked;
+  $('#impSingle').classList.toggle('hidden', split);
+  $('#impUpdateWrap').classList.toggle('hidden', !split);
+  $('#impName').disabled = !!$('#impTarget').value;
+}
+$('#impSplit').addEventListener('change', syncImpMode);
+$('#impTarget').addEventListener('change', syncImpMode);
+
 function updImpInfo() {
+  schedulePreview();
   const nt = Object.keys(imp.templates).length;
   const ev = imp.events ? (Array.isArray(imp.events) ? imp.events : (imp.events.data || imp.events.items || imp.events.events || [])) : [];
   $('#impInfo').innerHTML = `Файлов шаблонов: <b>${nt}</b> · событий: <b>${ev.length}</b>${imp.eventsName ? ' (' + esc(imp.eventsName) + ')' : ''}`
@@ -635,7 +732,8 @@ $('#impSql').addEventListener('change', async (ev) => {
 
 $('#btnImport').addEventListener('click', () => {
   Object.assign(imp, { templates: {}, settings: {}, events: null, eventsName: '', eventsFromFile: false, sql: [], sqlNames: [], sqlFromFile: false });
-  $('#impDir').value = ''; $('#impEvents').value = ''; $('#impSql').value = ''; updImpInfo();
+  $('#impDir').value = ''; $('#impEvents').value = ''; $('#impSql').value = '';
+  $('#impPublic').textContent = 'выберите источники…'; fillTargets(); updImpInfo();
   $('#importDlg').showModal();
 });
 
@@ -646,11 +744,17 @@ $('#importDlg').addEventListener('close', async () => {
   const res = await api('POST', 'import', {
     events: imp.events, templates: imp.templates, settings: imp.settings, sql: imp.sql,
     name: $('#impName').value, split: $('#impSplit').checked,
+    target: $('#impSplit').checked ? null : ($('#impTarget').value || null),
+    update: $('#impUpdate').checked,
+    public: [...document.querySelectorAll('#impPublic input:checked')].map((i) => i.value),
   });
   await loadTopos();
-  if (res.topologies.length) {
-    toast(`Готово: топологий ${res.topologies.length}, шаблонов ${res.templates}${res.sql ? ` (из SQL ${res.sql.templates})` : ''}`);
-    openTopo(res.topologies[0]);
+  const ts = res.topologies;
+  if (ts.length) {
+    const sum = (k) => ts.reduce((a, t) => a + t[k], 0);
+    const upd = ts.filter((t) => !t.new).length;
+    toast(`Схем: новых ${ts.length - upd}, обновлено ${upd} · узлов +${sum('added')}, ~${sum('updated')}, пропало ${sum('stale')}`);
+    openTopo(ts[0].id);
   } else toast(`Библиотека шаблонов обновлена: ${res.templates}`);
 });
 

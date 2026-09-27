@@ -91,6 +91,13 @@ def db():
 def init_db():
     with db() as con:
         con.executescript(SCHEMA)
+        # миграции: колонки для повторного импорта
+        for table, col, ddl in (('topologies', 'source', 'TEXT'), ('nodes', 'uid', 'TEXT'),
+                                ('nodes', 'auto', 'INTEGER DEFAULT 0'), ('nodes', 'edited', 'INTEGER DEFAULT 0'),
+                                ('edges', 'uid', 'TEXT'), ('edges', 'auto', 'INTEGER DEFAULT 0')):
+            cols = [r[1] for r in con.execute(f'PRAGMA table_info({table})')]
+            if col not in cols:
+                con.execute(f'ALTER TABLE {table} ADD COLUMN {col} {ddl}')
 
 
 def row(r):
@@ -113,33 +120,53 @@ def touch(con, tid):
 
 # ---------------------------------------------------------------- импорт
 
-class Builder:
-    """Строит граф одной топологии из событий и библиотеки шаблонов."""
+USER_PROFILES = {p.strip() for p in (os.environ.get('SHM_TOPO_USER_PROFILES') or 'telegram_bot').split(',') if p.strip()}
+# поля, которые пользователь мог поправить руками — при повторном импорте их не трогаем
+USER_FIELDS = ('title', 'subtitle', 'content')
+USER_META = ('buttons', 'subject')
 
-    def __init__(self, con, tid, depth=6):
-        self.con, self.tid, self.depth = con, tid, depth
-        self.nodes = {}
-        self.edges = set()
-        self.lib = {r['name']: row(r) for r in con.execute('SELECT name, content, settings AS meta FROM templates')}
+
+def recipient(profile):
+    if not profile or profile in USER_PROFILES:
+        return 'user', '👤 Пользователю'
+    return 'group', f'👥 Группа {profile}'
+
+
+class Builder:
+    """Строит граф в памяти: узлы и связи со стабильными uid, чтобы повторный импорт мог обновлять схему."""
+
+    def __init__(self, lib, depth=6):
+        self.lib, self.depth = lib, depth
+        self.nodes = {}          # uid -> поля
+        self.edges = {}          # uid -> {s, t, kind, label, meta}
+        self._info = {}
+
+    def info(self, name):
+        if name not in self._info:
+            src = (self.lib.get(name) or {}).get('content')
+            self._info[name] = tplparse.analyze(src) if src is not None else None
+        return self._info[name]
+
+    def settings(self, name):
+        return (self.lib.get(name) or {}).get('meta') or {}
 
     def node(self, uid, **f):
-        if uid in self.nodes:
-            return self.nodes[uid], False
-        cur = self.con.execute(
-            'INSERT INTO nodes (topology_id, type, key, title, subtitle, content, meta) VALUES (?,?,?,?,?,?,?)',
-            (self.tid, f.get('type', 'template'), f.get('key', ''), f.get('title', ''), f.get('subtitle', ''),
-             f.get('content', ''), _meta(f.get('meta'))))
-        self.nodes[uid] = cur.lastrowid
-        return cur.lastrowid, True
+        created = uid not in self.nodes
+        if created:
+            self.nodes[uid] = {'type': 'template', 'key': '', 'title': '', 'subtitle': '', 'content': '', 'meta': {}, **f}
+        return uid, created
 
     def edge(self, s, t, kind, label='', meta=None):
-        k = (s, t, kind, label)
-        if k in self.edges:
-            return
-        self.edges.add(k)
-        self.con.execute('INSERT INTO edges (topology_id, source_id, target_id, kind, label, meta) VALUES (?,?,?,?,?,?)',
-                         (self.tid, s, t, kind, label, _meta(meta)))
+        base = f'{s}|{t}|{kind}'
+        uid, n = base, 1
+        while uid in self.edges:
+            if self.edges[uid]['label'] == label:
+                return
+            n += 1
+            uid = f'{base}#{n}'
+        self.edges[uid] = {'s': s, 't': t, 'kind': kind, 'label': label, 'meta': meta or {}}
 
+    # --- входы
     def event(self, ev):
         name = ev.get('name') or '?'
         kind = ev.get('kind') or ''
@@ -149,8 +176,7 @@ class Builder:
         tpl = st.get('template_id')
         if not tpl:
             return
-        tpl_settings = (self.lib.get(tpl) or {}).get('meta') or {}
-        subject = st.get('subject') or tpl_settings.get('subject')
+        subject = st.get('subject') or self.settings(tpl).get('subject')
         tn = self.template(tpl, email=bool(st.get('subject')), subject=subject)
         parts = []
         cat = st.get('category')
@@ -162,57 +188,164 @@ class Builder:
                   {'event_id': ev.get('id'), 'category': cat, 'server_gid': ev.get('server_gid'),
                    'event_title': ev.get('title')})
 
+    def public(self, name):
+        """Публичный шаблон (allow_public): узлы-входы по веткам диспетчера или один вход API."""
+        tn = self.template(name)
+        info = self.info(name)
+        ent = info and info.get('entries')
+        if ent:
+            for v in ent['values']:
+                en, _ = self.node(f'entry:{name}:{v}', type='entry', key=v,
+                                  title=tplparse.REMNA_RU.get(v, v), subtitle=f'{name} · {ent["param"]} = {v}',
+                                  meta={'template': name, 'param': ent['param'], 'value': v})
+                self.edge(en, tn, 'handler', '')
+        else:
+            en, _ = self.node(f'entry:{name}', type='entry', key=name, title=f'/shm/v1/public/{name}',
+                              subtitle='публичный HTTP-вход', meta={'template': name})
+            self.edge(en, tn, 'handler', '')
+
+    # --- шаблоны
     def template(self, name, email=False, subject=None, level=0):
-        src = (self.lib.get(name) or {}).get('content')
-        settings = (self.lib.get(name) or {}).get('meta') or {}
-        info = tplparse.analyze(src) if src else None
-        meta = {'missing': src is None}
-        if settings:
-            meta['settings'] = settings
+        info = self.info(name)
+        meta = {'missing': info is None}
+        st = self.settings(name)
+        if st:
+            meta['settings'] = st
+            if st.get('allow_public'):
+                meta['public'] = True
         if info:
-            if info['http']:
-                meta['http'] = info['http']
-            if info['guards']:
-                meta['guards'] = info['guards']
+            for k in ('http', 'guards', 'guards_tech', 'actions'):
+                if info.get(k):
+                    meta[k] = info[k]
             if info['stops']:
                 meta['stops'] = [x['when'] for x in info['stops']]
         nid, created = self.node('tpl:' + name, type='template', key=name, title=name,
                                  subtitle=(info or {}).get('description', ''), meta=meta)
         if email and ('mail:' + name) not in self.nodes:
-            text = (info or {}).get('email_text', '')
             mid, _ = self.node('mail:' + name, type='email', key=name, title=subject or name,
-                               content=text, meta={'subject': subject or ''})
+                               content=(info or {}).get('email_text', ''), meta={'subject': subject or ''})
             self.edge(nid, mid, 'sends', 'письмо')
-        if not created or not info or level >= self.depth:
-            return nid
+        if created and info and level < self.depth:
+            self.expand(nid, name, info, level)
+        return nid
+
+    def bot_command(self, bot, cmd, level):
+        uid = f'bot:{bot}:{cmd}'
+        src = (self.lib.get(bot) or {}).get('content')
+        section = tplparse.bot_case(src, cmd) if src else None
+        nid, created = self.node(uid, type='bot_cmd', key=bot, title=cmd, subtitle=f'команда бота {bot}',
+                                 meta={'bot': bot, 'cmd': cmd, 'missing': section is None})
+        if created and section is not None and level < self.depth:
+            info = tplparse.analyze(section)
+            if info['actions']:
+                self.nodes[uid]['meta']['actions'] = info['actions']
+            self.expand(nid, f'{bot}:{cmd}', info, level, in_bot=True)
+        return nid
+
+    def expand(self, nid, name, info, level, in_bot=False):
         for i, m in enumerate(info['tg']):
-            mid, _ = self.node(f'tg:{name}:{i}', type='tg_message', key=name, title=m['method'],
-                               subtitle=m['media'], content=m['text'],
-                               meta={'buttons': m['buttons'], 'when': m['when']})
-            self.edge(nid, mid, 'sends', '' if m['when'] else 'Telegram', {'when': m['when']})
+            kind, label = recipient(None if in_bot else m['profile'])
+            mid, _ = self.node(f'tg:{name}:{i}', type='tg_message', key=name, title=label,
+                               subtitle=m['method'] + (f' · {m["media"]}' if m['media'] else ''), content=m['text'],
+                               meta={'buttons': m['buttons'], 'when': m['when'], 'when_tech': m['when_tech'],
+                                     'profile': m['profile'], 'recipient': kind})
+            self.edge(nid, mid, 'sends', '', {'when': m['when']})
+        for i, m in enumerate(info['push']):
+            mid, _ = self.node(f'push:{name}:{i}', type='push', key=name, title=m['title'] or 'Push',
+                               subtitle='Happ push' + (f' · {m["push_type"]}' if m['push_type'] else ''),
+                               content=m['text'],
+                               meta={'link': m['link'], 'when': m['when'], 'when_tech': m['when_tech']})
+            self.edge(nid, mid, 'sends', '', {'when': m['when']})
+        for b in info['bot_calls']:
+            bn = self.bot_command(b['bot'], b['cmd'], level + 1)
+            self.edge(nid, bn, 'calls', 'команда бота', {'when': b['when'], 'when_tech': b['when_tech']})
         for j in info['spool']:
+            j = dict(j)
             j['when'] = [w for w in j['when'] if w not in info['guards']]
-            tpl_settings = (self.lib.get(j['template']) or {}).get('meta') or {}
             is_mail = j['transport'] == 'mail'
             tn = self.template(j['template'], email=is_mail,
-                               subject=tpl_settings.get('subject'), level=level + 1)
-            if j['period']:
-                self.edge(nid, tn, 'periodic', 'каждые ' + tplparse.human_seconds(j['period']), j)
+                               subject=self.settings(j['template']).get('subject'), level=level + 1)
+            if j.get('custom_event'):
+                ce = j['custom_event']
+                lbl = 'custom event' + (f' {ce}' if isinstance(ce, str) else '')
+            elif j['period']:
+                lbl = 'каждые ' + tplparse.human_seconds(j['period'])
+            elif j['delay']:
+                lbl = 'через ' + tplparse.human_seconds(j['delay'])
+            elif j.get('delay_expr'):
+                lbl = 'через ' + j['delay_expr'] + ' сек'
             else:
-                if j.get('custom_event'):
-                    ce = j['custom_event']
-                    lbl = 'custom event' + (f' {ce}' if isinstance(ce, str) else '')
-                elif j['delay']:
-                    lbl = 'через ' + tplparse.human_seconds(j['delay'])
-                elif j.get('delay_expr'):
-                    lbl = 'через ' + j['delay_expr'] + ' сек'
-                else:
-                    lbl = 'сразу'
-                self.edge(nid, tn, 'delayed', lbl, j)
+                lbl = 'сразу'
+            self.edge(nid, tn, 'periodic' if j['period'] else 'delayed', lbl, j)
         for c in info['calls']:
             tn = self.template(c, level=level + 1)
             self.edge(nid, tn, 'calls', 'вызывает')
-        return nid
+
+    # --- запись в БД
+    def write(self, con, tid):
+        """Создаёт или обновляет узлы/связи топологии. Ручные узлы и связи не трогает."""
+        stats = {'added': 0, 'updated': 0, 'stale': 0}
+        old = {r['uid']: row(r) for r in con.execute('SELECT * FROM nodes WHERE topology_id=? AND uid IS NOT NULL', (tid,))}
+        ids = {}
+        for uid, f in self.nodes.items():
+            meta = dict(f['meta'])
+            meta['auto_hash'] = _hash(f['title'], f['content'], meta.get('buttons'), meta.get('subject'))
+            o = old.get(uid)
+            if not o:
+                cur = con.execute('INSERT INTO nodes (topology_id, uid, auto, type, key, title, subtitle, content, meta) '
+                                  'VALUES (?,?,1,?,?,?,?,?,?)',
+                                  (tid, uid, f['type'], f['key'], f['title'], f['subtitle'], f['content'], _meta(meta)))
+                ids[uid] = cur.lastrowid
+                stats['added'] += 1
+                continue
+            ids[uid] = o['id']
+            vals = {k: f[k] for k in USER_FIELDS}
+            if o.get('edited'):
+                # правки пользователя сохраняем; помечаем, если шаблон с тех пор изменился
+                vals = {k: o[k] for k in USER_FIELDS}
+                for k in USER_META:
+                    if k in (o['meta'] or {}):
+                        meta[k] = o['meta'][k]
+                if (o['meta'] or {}).get('auto_hash') != meta['auto_hash']:
+                    meta['src_changed'] = True
+                    meta['src_new'] = {'title': f['title'], 'content': f['content'], 'buttons': f['meta'].get('buttons')}
+                elif (o['meta'] or {}).get('src_changed'):  # флаг держится, пока пользователь не решит
+                    meta['src_changed'] = True
+                    meta['src_new'] = o['meta'].get('src_new')
+            con.execute('UPDATE nodes SET type=?, key=?, title=?, subtitle=?, content=?, meta=? WHERE id=?',
+                        (f['type'], f['key'], vals['title'], vals['subtitle'], vals['content'], _meta(meta), o['id']))
+            stats['updated'] += 1
+        for uid, o in old.items():
+            if uid not in self.nodes and o.get('auto'):
+                m = o['meta'] or {}
+                if not m.get('stale'):
+                    m['stale'] = True
+                    con.execute('UPDATE nodes SET meta=? WHERE id=?', (_meta(m), o['id']))
+                    stats['stale'] += 1
+        old_e = {r['uid']: row(r) for r in con.execute('SELECT * FROM edges WHERE topology_id=? AND uid IS NOT NULL', (tid,))}
+        for uid, e in self.edges.items():
+            s, t = ids.get(e['s']), ids.get(e['t'])
+            if not s or not t:
+                continue
+            o = old_e.get(uid)
+            if o:
+                con.execute('UPDATE edges SET source_id=?, target_id=?, kind=?, label=?, meta=? WHERE id=?',
+                            (s, t, e['kind'], e['label'], _meta(e['meta']), o['id']))
+            else:
+                con.execute('INSERT INTO edges (topology_id, uid, auto, source_id, target_id, kind, label, meta) '
+                            'VALUES (?,?,1,?,?,?,?,?)', (tid, uid, s, t, e['kind'], e['label'], _meta(e['meta'])))
+        for uid, o in old_e.items():
+            if uid not in self.edges and o.get('auto'):
+                m = o['meta'] or {}
+                m['stale'] = True
+                con.execute('UPDATE edges SET meta=? WHERE id=?', (_meta(m), o['id']))
+        touch(con, tid)
+        return stats
+
+
+def _hash(*parts):
+    import hashlib
+    return hashlib.sha1(json.dumps(parts, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 def extract_events(data):
@@ -224,10 +357,11 @@ def extract_events(data):
     return data if isinstance(data, list) else []
 
 
-def do_import(payload):
+def collect(payload):
+    """Собирает шаблоны/настройки/события из файлов, SQL-дампов и JSON."""
     events = extract_events(payload.get('events'))
-    templates = payload.get('templates') or {}
-    settings = payload.get('settings') or {}
+    templates = dict(payload.get('templates') or {})
+    settings = dict(payload.get('settings') or {})
     sql_info = None
     for sql in payload.get('sql') or []:
         # SQL-дамп дополняет файлы; при совпадении имён приоритет у дампа (он свежее выгрузки из SHM)
@@ -237,41 +371,87 @@ def do_import(payload):
         if ev and not events:
             events = ev
         sql_info = {'templates': len(t), 'events': len(ev)}
+    return events, templates, settings, sql_info
+
+
+def save_library(con, templates, settings):
+    for tname, content in templates.items():
+        st = settings.get(tname)
+        con.execute(
+            "INSERT INTO templates (name, content, settings, updated_at) VALUES (?,?,?,datetime('now')) "
+            "ON CONFLICT(name) DO UPDATE SET content=excluded.content, settings=excluded.settings, updated_at=excluded.updated_at",
+            (tname, content, json.dumps(st or {}, ensure_ascii=False)))
+    for tname, st in settings.items():
+        if tname not in templates:
+            con.execute("UPDATE templates SET settings=? WHERE name=?", (json.dumps(st, ensure_ascii=False), tname))
+
+
+def load_library(con):
+    return {r['name']: row(r) for r in con.execute('SELECT name, content, settings AS meta FROM templates')}
+
+
+def do_preview(payload):
+    events, templates, settings, sql_info = collect(payload)
+    with LOCK, db() as con:
+        lib = load_library(con)
+    for n, c in templates.items():
+        lib[n] = {'content': c, 'meta': settings.get(n) or (lib.get(n) or {}).get('meta') or {}}
+    for n, st in settings.items():
+        lib.setdefault(n, {'content': None, 'meta': {}})['meta'] = st
+    public = []
+    for n, t in sorted(lib.items()):
+        if (t.get('meta') or {}).get('allow_public') and t.get('content') is not None:
+            info = tplparse.analyze(t['content'])
+            public.append({'name': n, 'actions': tplparse.has_actions(info),
+                           'entries': (info['entries'] or {}).get('values', [])})
+    return {'events': len(events), 'templates': len(templates), 'sql': sql_info, 'public': public}
+
+
+def do_import(payload):
+    events, templates, settings, sql_info = collect(payload)
     name = (payload.get('name') or 'Импорт').strip()
     split = bool(payload.get('split'))
-    created = []
+    public = payload.get('public') or []
+    target = payload.get('target')          # id топологии для обновления (без split) или None
+    update = payload.get('update', True)    # split: обновлять схемы с тем же источником
+    depth = int(payload.get('depth') or 6)
+    result = []
     with LOCK, db() as con:
-        for tname, content in templates.items():
-            st = settings.get(tname)
-            con.execute(
-                "INSERT INTO templates (name, content, settings, updated_at) VALUES (?,?,?,datetime('now')) "
-                "ON CONFLICT(name) DO UPDATE SET content=excluded.content, "
-                "settings=COALESCE(excluded.settings, templates.settings), updated_at=excluded.updated_at",
-                (tname, content, json.dumps(st, ensure_ascii=False) if st is not None else '{}'))
-        for tname, st in settings.items():
-            if tname not in templates:
-                con.execute("UPDATE templates SET settings=? WHERE name=?", (json.dumps(st, ensure_ascii=False), tname))
-        if not events:
-            return {'topologies': [], 'templates': len(templates), 'sql': sql_info}
+        save_library(con, templates, settings)
+        lib = load_library(con)
         if split:
             groups = {}
             for ev in events:
                 groups.setdefault(ev.get('name') or '?', []).append(ev)
-            order = sorted(groups)
-            groups = [(g + (f' — {EVENT_NAMES[g]}' if g in EVENT_NAMES else ''), groups[g]) for g in order]
+            plan = [(f'event:{g}', g + (f' — {EVENT_NAMES[g]}' if g in EVENT_NAMES else ''), groups[g], [])
+                    for g in sorted(groups)]
+            plan += [(f'public:{p}', f'🌐 {p}', [], [p]) for p in public]
         else:
-            groups = [(name, sorted(events, key=lambda e: (e.get('name') or '', e.get('id') or 0)))]
-        for tname, evs in groups:
-            cur = con.execute('INSERT INTO topologies (name, description) VALUES (?, ?)',
-                              (tname, f'Импортировано событий: {len(evs)}'))
-            b = Builder(con, cur.lastrowid, depth=int(payload.get('depth') or 6))
+            plan = [('import', name, sorted(events, key=lambda e: (e.get('name') or '', e.get('id') or 0)), public)]
+        for source, title, evs, pubs in plan:
+            if not evs and not pubs:
+                continue
+            tid = None
+            if not split and target:
+                tid = int(target)
+                con.execute('UPDATE topologies SET source=COALESCE(source, ?) WHERE id=?', (source, tid))
+            elif split and update:
+                r = con.execute('SELECT id FROM topologies WHERE source=? ORDER BY id DESC LIMIT 1', (source,)).fetchone()
+                tid = r and r['id']
+            is_new = not tid
+            if is_new:
+                tid = con.execute('INSERT INTO topologies (name, description, source) VALUES (?,?,?)',
+                                  (title, f'Событий: {len(evs)}, публичных шаблонов: {len(pubs)}', source)).lastrowid
+            b = Builder(lib, depth)
             for ev in evs:
                 b.event(ev)
-            created.append(cur.lastrowid)
-    return {'topologies': created, 'templates': len(templates), 'sql': sql_info}
+            for p in pubs:
+                b.public(p)
+            st = b.write(con, tid)
+            real = con.execute('SELECT name FROM topologies WHERE id=?', (tid,)).fetchone()
+            result.append({'id': tid, 'name': real['name'] if real else title, 'new': is_new, **st})
+    return {'topologies': result, 'templates': len(templates), 'sql': sql_info}
 
-
-# ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
     server_version = 'SHMTopology/1.0'
@@ -394,6 +574,20 @@ class Handler(BaseHTTPRequestHandler):
                     nodes = [row(r) for r in con.execute('SELECT * FROM nodes WHERE topology_id=?', (tid,))]
                     edges = [row(r) for r in con.execute('SELECT * FROM edges WHERE topology_id=?', (tid,))]
                     return self.send_json({'format': 'shm-topology/1', 'topology': t, 'nodes': nodes, 'edges': edges})
+            if res == 'nodes' and n == 3 and p[2] in ('accept', 'keep') and m == 'POST':
+                # ответ на «шаблон изменился»: принять новый текст из шаблона или оставить свой
+                nd = row(con.execute('SELECT * FROM nodes WHERE id=?', (int(p[1]),)).fetchone())
+                meta = nd['meta'] or {}
+                new = meta.pop('src_new', None) or {}
+                meta.pop('src_changed', None)
+                if p[2] == 'accept':
+                    if 'buttons' in new and new['buttons'] is not None:
+                        meta['buttons'] = new['buttons']
+                    con.execute('UPDATE nodes SET title=?, content=?, meta=?, edited=0 WHERE id=?',
+                                (new.get('title', nd['title']), new.get('content', nd['content']), _meta(meta), nd['id']))
+                else:
+                    con.execute('UPDATE nodes SET meta=? WHERE id=?', (_meta(meta), nd['id']))
+                return self.send_json(row(con.execute('SELECT * FROM nodes WHERE id=?', (nd['id'],)).fetchone()))
             if res == 'restore' and m == 'POST':
                 return self.send_json({'id': self.restore(con, self.body())})
             # --- узлы / связи
@@ -408,6 +602,8 @@ class Handler(BaseHTTPRequestHandler):
                     for k, v in b.items():
                         if k in cols:
                             con.execute(f'UPDATE {table} SET {k}=? WHERE id=?', (_meta(v) if k == 'meta' else v, iid))
+                    if table == 'nodes' and any(k in b for k in ('title', 'subtitle', 'content', 'meta', 'type')):
+                        con.execute('UPDATE nodes SET edited=1 WHERE id=?', (iid,))
                     touch(con, r['topology_id'])
                     return self.send_json(row(con.execute(f'SELECT * FROM {table} WHERE id=?', (iid,)).fetchone()))
                 if m == 'DELETE':
@@ -422,6 +618,8 @@ class Handler(BaseHTTPRequestHandler):
                     r = con.execute('SELECT * FROM templates WHERE name=?', (p[1],)).fetchone()
                     return self.send_json(row(r) if r else {'error': 'not found'}, 200 if r else 404)
         if res == 'import' and m == 'POST':
+            if n == 2 and p[1] == 'preview':
+                return self.send_json(do_preview(self.body()))
             return self.send_json(do_import(self.body()))
         self.send_json({'error': 'not found'}, 404)
 
