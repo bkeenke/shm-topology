@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SHM Topology</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🕸</text></svg>">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<aside id="sidebar">
+  <div class="brand">SHM <b>Topology</b></div>
+  <div class="side-actions">
+    <button id="btnNewTopo" class="btn">＋ Новая</button>
+    <button id="btnImport" class="btn primary">⇪ Импорт</button>
+  </div>
+  <input id="topoFilter" class="input" placeholder="Фильтр топологий…">
+  <ul id="topoList"></ul>
+  <div class="side-foot">
+    <button id="btnRestore" class="btn ghost small">Загрузить из .json</button>
+    <input id="restoreFile" type="file" accept=".json" hidden>
+  </div>
+</aside>
+
+<main id="main">
+  <header id="toolbar">
+    <input id="topoName" class="title-input" placeholder="Название топологии" disabled>
+    <div class="tb-group">
+      <select id="addType" class="input small">
+        <option value="event">⚡ Событие</option>
+        <option value="template">🧩 Шаблон</option>
+        <option value="tg_message" selected>💬 TG-сообщение</option>
+        <option value="email">✉️ Письмо</option>
+        <option value="job">⏱ Задача</option>
+        <option value="note">📝 Заметка</option>
+      </select>
+      <button id="btnAdd" class="btn small">＋ Узел</button>
+    </div>
+    <div class="tb-group">
+      <input id="search" class="input small" placeholder="Поиск узла… (/)">
+      <button id="btnLayout" class="btn small" title="Авто-раскладка">⌗ Раскладка</button>
+      <button id="btnFit" class="btn small" title="Показать всё (F)">⤢</button>
+      <span class="help" title="Колесо — зум · перетаскивание фона — сдвиг · тяни ● справа у узла — новая связь · двойной клик по фону — заметка · Del — удалить · F — показать всё · / — поиск">?</span>
+      <button id="btnZoomOut" class="btn small">−</button>
+      <span id="zoomVal">100%</span>
+      <button id="btnZoomIn" class="btn small">＋</button>
+    </div>
+    <div class="tb-group">
+      <button id="btnDup" class="btn small ghost" title="Дублировать топологию">⧉</button>
+      <button id="btnExport" class="btn small ghost" title="Экспорт в JSON">⇩</button>
+      <button id="btnDelTopo" class="btn small ghost danger" title="Удалить топологию">🗑</button>
+    </div>
+  </header>
+
+  <div id="canvas">
+    <div id="world">
+      <svg id="edges"><defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="context-stroke"/></marker>
+      </defs></svg>
+      <div id="nodes"></div>
+    </div>
+    <svg id="ghost"><path id="ghostPath"/></svg>
+    <div id="empty" class="empty">
+      <h2>Нет открытой топологии</h2>
+      <p>Создайте новую или импортируйте <code>events.json</code> вместе с папкой шаблонов — связи построятся автоматически.</p>
+    </div>
+    <div id="legend">
+      <span><i class="lg event"></i>Событие</span>
+      <span><i class="lg template"></i>Шаблон</span>
+      <span><i class="lg tg_message"></i>TG</span>
+      <span><i class="lg email"></i>Письмо</span>
+      <span><i class="lg job"></i>Задача</span>
+      <span><i class="lg note"></i>Заметка</span>
+      <span class="sep"></span>
+      <span><i class="le handler"></i>обработчик</span>
+      <span><i class="le delayed"></i>отложенно</span>
+      <span><i class="le periodic"></i>периодично</span>
+      <span><i class="le sends"></i>отправляет</span>
+      <span><i class="le calls"></i>вызывает</span>
+    </div>
+  </div>
+</main>
+
+<aside id="panel" class="hidden">
+  <div class="panel-head">
+    <span id="panelTitle">Узел</span>
+    <button id="panelClose" class="btn ghost small">✕</button>
+  </div>
+  <div id="panelBody"></div>
+</aside>
+
+<dialog id="importDlg">
+  <form method="dialog" class="dlg">
+    <h3>Импорт событий SHM</h3>
+    <p class="muted">Источники можно комбинировать: папка с <code>*.tpl</code>/<code>*.tpls</code>, SQL-дамп таблицы <code>templates</code> (и <code>events</code>, если есть) и JSON событий. <code>.json</code> и <code>.sql</code> из выбранной папки подхватываются автоматически.</p>
+    <label class="field">Папка с шаблонами
+      <input id="impDir" type="file" webkitdirectory multiple>
+    </label>
+    <label class="field">SQL-дамп шаблонов (.sql)
+      <input id="impSql" type="file" accept=".sql,text/plain">
+    </label>
+    <label class="field">Файл событий (.json)
+      <input id="impEvents" type="file" accept=".json,application/json">
+    </label>
+    <div id="impInfo" class="muted small"></div>
+    <label class="field">Название
+      <input id="impName" class="input" value="Все события">
+    </label>
+    <label class="check"><input id="impSplit" type="checkbox"> Отдельная топология на каждое событие (registered, payment, …)</label>
+    <div class="dlg-actions">
+      <button value="cancel" class="btn ghost">Отмена</button>
+      <button id="impGo" value="default" class="btn primary">Построить</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast"></div>
+<script src="/vendor/dagre.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
