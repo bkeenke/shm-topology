@@ -812,6 +812,10 @@ def _strip_parens(s):
 
 
 def human_atom(a, neg=False):
+    a2 = _strip_parens(re.sub(r'\s+', ' ', a))
+    # скобочная группа (A || B) внутри && — это не атом
+    if len(_split_top(a2, ('||', ' or ', ' OR '))) > 1 or len(_split_top(a2, ('&&', ' and ', ' AND '))) > 1:
+        return human_cond(a2, neg)
     r = _atom(a, neg)
     return r if isinstance(r, H) else H(r)
 
@@ -917,7 +921,14 @@ def _human_cond(c, neg=False):
     if len(ors) > 1:
         if neg:
             return ' и '.join(human_cond(o, True) for o in ors)
-        return ' ИЛИ '.join('(' + human_cond(o) + ')' if len(_split_top(o, ('&&', ' and ', ' AND '))) > 1 else human_cond(o) for o in ors)
+        parts, seen = [], set()
+        for o in ors:
+            h = '(' + human_cond(o) + ')' if len(_split_top(o, ('&&', ' and ', ' AND '))) > 1 else str(human_cond(o))
+            k = re.sub(r' \(.*\)$', '', h).lower()
+            if k not in seen:
+                seen.add(k)
+                parts.append(h)
+        return ' ИЛИ '.join(parts)
     ands = _split_top(c, ('&&', ' and ', ' AND '))
     if len(ands) > 1:
         if neg:
