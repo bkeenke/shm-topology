@@ -293,13 +293,84 @@ def _resolve_str(vs, expr, pos, default=None):
     return r[1] if r and r[0] == 'str' else default
 
 
-def parse_tg_sends(src, vs=None):
+def _hash_of_var(src, var, pos):
+    """Текст хеша/массива из последнего `var = { … }` (или `[ … ]`) перед pos."""
+    found = None
+    for m in re.finditer(r'(?<![\w.])' + re.escape(var) + r'\s*=\s*\(?\s*([\[{])', src[:pos]):
+        found = m
+    if not found:
+        return None
+    o = found.start(1)
+    return src[o:_match_bracket(src, o, src[o], ']' if src[o] == '[' else '}') + 1]
+
+
+def _directive_at(src, pos, _cache={}):
+    key = id(src)
+    if _cache.get('key') != key:
+        _cache.clear()
+        _cache.update(key=key, list=[(d.start(), d.end(), d.group(1)) for d in DIRECTIVE_RE.finditer(src)])
+    for a, b, body in _cache['list']:
+        if a <= pos < b:
+            return a, b, body
+    return None
+
+
+def _dynamic_buttons(src, var, pos, flow, send_conds):
+    """Кнопки из `var = [...]` и `var.push([...]) IF …` перед отправкой; у каждой — условия показа."""
+    rows = []
+    reset = None
+    for m in re.finditer(r'(?<![\w.])' + re.escape(var) + r'\s*=\s*\[', src[:pos]):
+        reset = m
+    if reset:
+        lit = src[reset.end() - 1:_match_bracket(src, reset.end() - 1, '[', ']') + 1]
+        if lit.strip('[] \n\t'):
+            rows += parse_keyboard('inline_keyboard = ' + lit)
+    have = {str(c) for c in send_conds}
+    for m in re.finditer(r'(?<![\w.])' + re.escape(var) + r'\s*\.\s*push\s*\(', src[:pos]):
+        if reset and m.start() < reset.start():
+            continue
+        o = m.end() - 1
+        c = _match_bracket(src, o, '(', ')')
+        arg = src[o + 1:c].strip()
+        inner = arg[1:].lstrip() if arg.startswith('[') else ''
+        push_rows = parse_keyboard('inline_keyboard = [' + arg + ']' if inner.startswith('{') else 'inline_keyboard = ' + arg)
+        when = []
+        conds, _ = flow.at(m.start())
+        when += [x for x in conds if str(x) not in have]
+        d = _directive_at(src, m.start())
+        if d:   # постфиксный `… ) IF условие` в той же директиве
+            tail = src[c + 1:d[1]]
+            pm = re.match(r'\s*(IF|UNLESS)\s+(.+?)\s*-?\}\}$', tail, re.I | re.S)
+            if pm:
+                when.append(human_cond(flow._subst(pm.group(2), m.start()), pm.group(1).upper() == 'UNLESS'))
+        w = [str(x) for x in when if not getattr(x, 'tech', False)] + [str(x) for x in when if getattr(x, 'tech', False)]
+        for row in push_rows:
+            for b in row:
+                if w:
+                    b['when'] = w
+            rows.append(row)
+    return rows
+
+
+def parse_tg_sends(src, vs=None, flow=None):
     vs = vs or Vars(src)
+    flow = flow or Flow(src, vs)
     blocks = find_blocks(src)
 
-    def block_text(var, pos):
-        cands = [b for b in blocks if b[0] == var and b[2] <= pos] or [b for b in blocks if b[0] == var]
-        return cands[-1][3] if cands else None
+    def captures(var, pos):
+        """Какие `var = BLOCK` могли выполниться перед отправкой в pos (по веткам IF)."""
+        send_path = flow.path_at(pos)
+        out = []
+        for b in blocks:
+            if b[0] != var or b[1] >= pos:
+                continue
+            ok, on_path = Flow.compatible(flow.path_at(b[1]), send_path)
+            if not ok:
+                continue
+            if on_path:
+                out = []
+            out.append(b)
+        return out
 
     out = []
     for pos, region, prof in _send_regions(src):
@@ -307,14 +378,30 @@ def parse_tg_sends(src, vs=None):
         method = mm.group(1) if mm else 'sendMessage'
         if method in NO_CONTENT:
             continue
+        # тело отправки в переменной: sendMessage = content
+        vm = re.fullmatch(r'\s*\w+\s*=?\s*(?:\(\s*)?([A-Za-z_]\w*)(?:\s*\))?\s*', region)
+        if vm and not re.search(KEY('(?:text|caption)'), region):
+            body = _hash_of_var(src, vm.group(1), pos)
+            if body:
+                region = method + ' = ' + body
+        send_conds, _ = flow.at(pos)
         text, variants = '', None
         tm = re.search(KEY('(?:text|caption)'), region)
         if tm:
             val, is_lit = _value_at(region, tm.end())
             inner = re.fullmatch(r'\{\{-?\s*(\w+)[^}]*\}\}', val.strip()) if is_lit else None
             var = inner.group(1) if inner else (None if is_lit else (re.fullmatch(r'\w+', val) or [None])[0])
-            if var and block_text(var, pos) is not None:
-                text = block_text(var, pos)
+            caps = captures(var, pos) if var else []
+            if len(caps) > 1:
+                # TEXT = BLOCK задан в нескольких ветках — у каждой свой текст (и свои варианты)
+                have = {str(c) for c in send_conds}
+                variants = []
+                for b in caps:
+                    own = [c for c in flow.at(b[1])[0] if str(c) not in have]
+                    for extra, vtext in (text_variants(b[3]) or [([], b[3])]):
+                        variants.append((own + extra, vtext))
+            elif caps:
+                text = caps[0][3]
                 variants = text_variants(text)
             elif is_lit:
                 text = val.replace('\\n', '\n')
@@ -329,13 +416,22 @@ def parse_tg_sends(src, vs=None):
         profile = None
         if prof:
             profile = _resolve_str(vs, prof, pos, prof)
-        buttons = parse_keyboard(region)
+        km = re.search(KEY('(?:inline_keyboard|keyboard)') + r'([A-Za-z_]\w*)\s*(?:[,}\n]|$)', region)
+        buttons = _dynamic_buttons(src, km.group(1), pos, flow, send_conds) if km else parse_keyboard(region)
         for extra, vtext in (variants or [([], text)]):
+            # у кнопок не повторяем условия, которые уже есть у самого варианта сообщения
+            known = {str(c) for c in extra}
+            vbuttons = [[{**b, 'when': [w for w in b['when'] if w not in known]} if b.get('when') else b for b in row]
+                        for row in buttons]
+            for row in vbuttons:
+                for b in row:
+                    if 'when' in b and not b['when']:
+                        del b['when']
             out.append({
                 'method': method,
                 'text': humanize_tt(vtext),
                 'media': media,
-                'buttons': buttons,
+                'buttons': vbuttons,
                 'profile': profile,
                 'extra_when': extra,
                 'variant': bool(variants),
@@ -675,8 +771,8 @@ def _split_when(conds):
 def analyze(src):
     desc = first_comment(src)
     body = strip_comments(src)
-    flow = Flow(body)
     vs = Vars(body)
+    flow = Flow(body, vs)
 
     def place(item):
         conds, dead = flow.at(item.pop('pos'))
@@ -684,7 +780,7 @@ def analyze(src):
         item['when'], item['when_tech'] = _split_when(conds)
         return not dead
 
-    tg = [m for m in parse_tg_sends(body, vs) if place(m)]
+    tg = [m for m in parse_tg_sends(body, vs, flow) if place(m)]
     push = [m for m in parse_push(body, vs) if place(m)]
     bots = [m for m in parse_bot_calls(body, vs) if place(m)]
     spool, seen = [], {}
@@ -720,6 +816,16 @@ def analyze(src):
 
 def has_actions(info):
     return bool(info['tg'] or info['push'] or info['bot_calls'] or info['spool'] or info['calls'] or info['mail_send'])
+
+
+def bot_cases(src):
+    """Команды бота: значения всех <% CASE … %>."""
+    out = []
+    for m in re.finditer(r'<%-?\s*CASE\b(.*?)-?%>', src or '', re.S | re.I):
+        for v in re.findall(r"""['"]([^'"]+)['"]""", m.group(1)):
+            if v not in out:
+                out.append(v)
+    return out
 
 
 def human_seconds(sec):
@@ -946,8 +1052,13 @@ class Flow:
 
     OPEN = ('IF', 'UNLESS', 'FOR', 'FOREACH', 'WHILE', 'BLOCK', 'SWITCH', 'WRAPPER', 'FILTER', 'TRY', 'PERL', 'RAWPERL')
 
-    def __init__(self, src):
+    def __init__(self, src, vs=None):
+        self.vs = vs
         self.snaps = [(0, ())]   # (pos, tuple условий)
+        self.paths = [(0, ())]   # (pos, путь веток: ((id IF, № ветки), ...))
+        self._ids = 0
+        # секции `<% CASE … %>` шаблона бота — тоже взаимоисключающие ветки
+        self.cases = [m.start() for m in re.finditer(r'<%-?\s*CASE\b', src, re.I)]
         self.blocks = {}         # name -> (start, end)
         self.process = {}        # name -> [pos]
         self.stops = []          # [(условия, где)]
@@ -960,13 +1071,19 @@ class Flow:
                 w = st.split(None, 1)
                 head, rest = w[0], (w[1] if len(w) > 1 else '')
                 top = stack[-1]
+                if head in ('IF', 'UNLESS', 'ELSIF', 'STOP', 'RETURN'):
+                    rest = self._subst(rest, d.start())
                 if head in ('IF', 'UNLESS'):
-                    stack.append({'kind': head, 'cond': human_cond(rest, head == 'UNLESS'), 'prior': [rest], 'guards': []})
+                    self._ids += 1
+                    stack.append({'kind': head, 'cond': human_cond(rest, head == 'UNLESS'), 'prior': [rest], 'guards': [],
+                                  'id': self._ids, 'br': 0})
                 elif head == 'ELSIF':
                     top['cond'] = human_cond(rest)
                     top['prior'].append(rest)
                     top['guards'] = []
+                    top['br'] = top.get('br', 0) + 1
                 elif head == 'ELSE' and top['kind'] in ('IF', 'UNLESS'):
+                    top['br'] = top.get('br', 0) + 1
                     pr = top['prior']
                     if top['kind'] == 'UNLESS':
                         top['cond'] = human_cond(pr[0])
@@ -980,8 +1097,10 @@ class Flow:
                     stack.append({'kind': 'FOR', 'cond': T(f'для каждого {m.group(1)} из {m.group(2).strip()[:60]}') if m else None,
                                   'prior': [], 'guards': []})
                 elif head == 'SWITCH':
-                    stack.append({'kind': 'SWITCH', 'cond': None, 'subj': rest, 'prior': [], 'guards': []})
+                    self._ids += 1
+                    stack.append({'kind': 'SWITCH', 'cond': None, 'subj': rest, 'prior': [], 'guards': [], 'id': self._ids, 'br': -1})
                 elif head == 'CASE' and top['kind'] == 'SWITCH':
+                    top['br'] += 1
                     top['cond'] = H(f'{top["subj"]} = {rest}' if rest and rest != 'DEFAULT' else f'{top["subj"]}: остальные случаи')
                 elif head == 'BLOCK' and rest:
                     name = rest.split()[0]
@@ -1003,7 +1122,45 @@ class Flow:
                     else:
                         self.stops.append((self._conds(stack), d.start()))
             self.snaps.append((d.end(), self._conds(stack)))
+            self.paths.append((d.end(), tuple((fr['id'], fr['br']) for fr in stack if 'id' in fr)))
         self.root_guards = list(stack[0]['guards'])
+
+    def _subst(self, cond, pos):
+        """status → user.settings.telegram.telegram_bot.status, если выше было `status = user.settings…status`."""
+        if not self.vs:
+            return cond
+
+        def repl(m):
+            a = self.vs.last(m.group(1), pos)
+            v = a[2][1] if a and a[2][0] in ('expr', 'ref') else None
+            return v if v and v != m.group(1) and re.fullmatch(r'[A-Za-z_][\w.]*\.[\w.]+', v) else m.group(1)
+        return re.sub(r'(?<![\w.\'"$])([A-Za-z_]\w*)(?![\w(])', repl, cond)
+
+    def path_at(self, pos):
+        lo, hi = 0, len(self.paths) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.paths[mid][0] <= pos:
+                lo = mid
+            else:
+                hi = mid - 1
+        path = self.paths[lo][1]
+        if self.cases:
+            n = sum(1 for c in self.cases if c <= pos)
+            path = (('case', n),) + path
+        return path
+
+    @staticmethod
+    def compatible(cap_path, send_path):
+        """-> (может выполниться перед отправкой, лежит на её пути)"""
+        mine = dict(send_path)
+        on_path = True
+        for node, br in cap_path:
+            if node not in mine:
+                on_path = False
+            elif mine[node] != br:
+                return False, False
+        return True, on_path
 
     @staticmethod
     def _conds(stack):

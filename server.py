@@ -291,8 +291,15 @@ class Builder:
                     meta[k] = info[k]
             if info['stops']:
                 meta['stops'] = [x['when'] for x in info['stops']]
+        src = (self.lib.get(name) or {}).get('content')
+        cases = tplparse.bot_cases(src) if src else []
+        if cases:
+            meta['bot_cases'] = cases
         nid, created = self.node('tpl:' + name, type='template', key=name, title=name,
-                                 subtitle=(info or {}).get('description', ''), meta=meta)
+                                 subtitle=f'шаблон бота · команд: {len(cases)}' if cases else (info or {}).get('description', ''),
+                                 meta=meta)
+        if cases:   # бот целиком не раскрываем: его команды появляются там, где их вызывают
+            return nid
         if email and ('mail:' + name) not in self.nodes:
             mid, _ = self.node('mail:' + name, type='email', key=name, title=subject or name,
                                content=(info or {}).get('email_text', ''), meta={'subject': subject or ''})

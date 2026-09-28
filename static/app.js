@@ -139,7 +139,7 @@ function nodeHTML(n) {
   if (text) body += `<div class="txt${text.split('\n').length > 9 || text.length > 420 ? ' clip' : ''}">${esc(text.slice(0, 900))}</div>`;
   if (m.buttons && m.buttons.length) {
     body += '<div class="kb">' + m.buttons.map((row) => '<div class="row">' + row.map((b) =>
-      `<span class="b ${esc(b.type || '')}" title="${esc((b.type || '') + ': ' + (b.action || ''))}">${esc(b.text)}</span>`).join('') + '</div>').join('') + '</div>';
+      `<span class="b ${esc(b.type || '')}${b.when && b.when.length ? ' cond' : ''}" title="${esc((b.type || '') + ': ' + (b.action || '') + (b.when && b.when.length ? '\nпоказывается, если: ' + b.when.join(', ') : ''))}">${b.when && b.when.length ? '◐ ' : ''}${esc(b.text)}</span>`).join('') + '</div>').join('') + '</div>';
   }
   if (n.type === 'push' && m.link) body += `<div class="kb"><div class="row"><span class="b url" title="${esc(m.link)}">открыть ссылку</span></div></div>`;
   if ((m.actions || []).length) body += `<div class="acts">${m.actions.map((a) => `<div>⚙ ${esc(a)}</div>`).join('')}</div>`;
@@ -585,13 +585,17 @@ function select(sel) {
 function closePanel() { $('#panel').classList.add('hidden'); }
 
 function buttonsToText(rows) {
-  return (rows || []).map((r) => r.map((b) => b.text + (b.action ? ` => ${b.type && b.type !== 'callback_data' ? b.type + ':' : ''}${b.action}` : '')).join('  ||  ')).join('\n');
+  return (rows || []).map((r) => r.map((b) => b.text + (b.action ? ` => ${b.type && b.type !== 'callback_data' ? b.type + ':' : ''}${b.action}` : '')
+    + (b.when && b.when.length ? `  [если: ${b.when.join('; ')}]` : '')).join('  ||  ')).join('\n');
 }
 
 function textToButtons(txt) {
   return txt.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => line.split('||').map((part) => {
+    let cond = null;
+    part = part.replace(/\s*\[если:\s*([^\]]*)\]\s*$/, (_, c) => { cond = c; return ''; });
     const [text, act] = part.split('=>').map((s) => s.trim());
     const b = { text };
+    if (cond) b.when = cond.split(';').map((x) => x.trim()).filter(Boolean);
     if (act) {
       const m = act.match(/^(url|web_app|switch_inline_query|copy_text|login_url):(.*)$/);
       b.type = m ? m[1] : 'callback_data'; b.action = m ? m[2].trim() : act;
@@ -634,6 +638,7 @@ function showNodePanel(n) {
     ${m.stale ? '<div class="field changed bad">✖ При последнем импорте этого узла в шаблонах уже не было. Можно удалить.</div>' : ''}
     ${(m.when || []).length ? `<div class="field">Когда срабатывает<ul class="conds">${m.when.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
     ${(m.when_tech || []).length ? `<details class="src"><summary>Технические проверки (${m.when_tech.length})</summary><ul class="conds tech">${m.when_tech.concat(m.guards_tech || []).map((w) => `<li>${esc(w)}</li>`).join('')}</ul></details>` : ''}
+    ${(m.bot_cases || []).length ? `<div class="field">Команды бота (${m.bot_cases.length})<div class="chips">${m.bot_cases.map((c) => `<span class="chip">${esc(c)}</span>`).join('')}</div></div>` : ''}
     ${(m.actions || []).length ? `<div class="field">Действия<ul class="conds">${m.actions.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>` : ''}
     ${m.link ? `<div class="field">Ссылка push<div class="chips"><span class="chip">${esc(m.link)}</span></div></div>` : ''}
     ${m.profile ? `<div class="field">Профиль Telegram<div class="chips"><span class="chip">${esc(m.profile)}</span></div></div>` : ''}

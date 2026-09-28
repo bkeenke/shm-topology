@@ -227,3 +227,4 @@ body.resizing iframe, body.resizing #canvas { pointer-events: none; }
 .badge.muted-b { background: rgba(139,147,164,.1); color: var(--muted); border: 1px dashed rgba(139,147,164,.4); }
 .node.unused { opacity: .6; }
 .node.unused:hover, .node.unused.sel { opacity: 1; }
+.node .kb .b.cond { border: 1px dashed rgba(207,227,255,.45); opacity: .85; }
